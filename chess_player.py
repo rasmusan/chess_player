@@ -27,12 +27,51 @@ import threading
 import time
 from typing import Optional, Tuple
 
+# Single source of truth for the version. build.ps1 reads (and bumps) this line.
+__version__ = "1.0.1"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Paths — work both from source and as a PyInstaller-frozen app
+# ──────────────────────────────────────────────────────────────────────────────
+
+FROZEN = getattr(sys, "frozen", False)
+
+if FROZEN:
+    # Bundled read-only resources (pieces.png, icon) are unpacked here
+    RESOURCE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    # Folder containing the installed exe (engines/ is installed next to it)
+    APP_DIR = os.path.dirname(sys.executable)
+    # Writable per-user data (engine history, log)
+    DATA_DIR = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "chess_player")
+else:
+    RESOURCE_DIR = APP_DIR = DATA_DIR = os.path.dirname(os.path.abspath(__file__))
+
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+except OSError:
+    pass
+
+# A windowed (no-console) build has sys.stdout/stderr = None, which makes print()
+# crash. Send output to a log file instead.
+NO_CONSOLE = sys.stdout is None or sys.stderr is None
+if NO_CONSOLE:
+    try:
+        _log = open(os.path.join(DATA_DIR, "chess_player.log"), "w", encoding="utf-8", buffering=1)
+    except OSError:
+        _log = open(os.devnull, "w")
+    sys.stdout = sys.stdout or _log
+    sys.stderr = sys.stderr or _log
+
+# Don't flash a console window for each engine process on Windows
+_POPEN_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Engine history helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
-_HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".engine_history.json")
+_HISTORY_FILE = os.path.join(DATA_DIR, ".engine_history.json")
 
 def _load_engine_history() -> list:
     try:
@@ -48,6 +87,30 @@ def _save_engine_history(path: str):
     try:
         with open(_HISTORY_FILE, "w", encoding="utf-8") as f:
             json.dump(history[:30], f, indent=2)
+    except OSError:
+        pass
+
+
+# Last engines used for White/Black, restored on the next start
+_LAST_ENGINES_FILE = os.path.join(DATA_DIR, ".last_engines.json")
+
+def _load_last_engines() -> dict:
+    try:
+        with open(_LAST_ENGINES_FILE, encoding="utf-8-sig") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+def _save_last_engines(white, black):
+    """white/black: UCIEngine or None."""
+    d = {
+        "white": os.path.abspath(white.path) if white else None,
+        "black": os.path.abspath(black.path) if black else None,
+    }
+    try:
+        with open(_LAST_ENGINES_FILE, "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=2)
     except OSError:
         pass
 
@@ -77,6 +140,7 @@ class UCIEngine:
             text=True,
             bufsize=1,
             cwd=os.path.dirname(abs_path),
+            creationflags=_POPEN_FLAGS,
         )
         threading.Thread(target=self._reader, daemon=True).start()
         self._send("uci")
@@ -312,7 +376,13 @@ class ChessGUI:
         import tkinter as tk
         self._tk = tk
         self.root = tk.Tk()
-        self.root.title("Chess Player")
+        self.root.title(f"Chess Player {__version__}")
+        ico = os.path.join(RESOURCE_DIR, "chess_player.ico")
+        if sys.platform == "win32" and os.path.exists(ico):
+            try:
+                self.root.iconbitmap(default=ico)
+            except tk.TclError:
+                pass
         self.root.resizable(False, False)
         self.root.configure(bg=self.BG_IDLE)
         self.white_name = white_name
@@ -412,7 +482,7 @@ class ChessGUI:
         except ImportError:
             return None
 
-        png = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pieces.png')
+        png = os.path.join(RESOURCE_DIR, 'pieces.png')
         if not os.path.exists(png):
             return None
 
@@ -859,7 +929,7 @@ class ChessGUI:
         side = "White" if color == chess.WHITE else "Black"
 
         # Build list: engines/ folder first, then history extras
-        engines_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "engines")
+        engines_dir = os.path.join(APP_DIR, "engines")
         items: list[tuple[str, str, str]] = []  # (display_name, abs_path, source)
         seen: set[str] = set()
 
@@ -1611,6 +1681,7 @@ Examples:
     parser.add_argument("--increment", "-i", type=float, default=0.0, metavar="SEC")
     parser.add_argument("--nogui",       action="store_true", help="Run headless (no window)")
     parser.add_argument("--pgn",         type=str, default=None, metavar="FILE")
+    parser.add_argument("--version", "-V", action="version", version=f"%(prog)s {__version__}")
     args = parser.parse_args()
 
     if args.nogui:
@@ -1646,13 +1717,6 @@ Examples:
     if args.black_engine and not os.path.isfile(args.black_engine):
         sys.exit(f"Error: engine not found (--b): {args.black_engine}")
 
-    engines_ready = bool(args.white_engine and args.black_engine)
-
-    white_name = os.path.splitext(os.path.basename(args.white_engine))[0] if args.white_engine else "—"
-    black_name = os.path.splitext(os.path.basename(args.black_engine))[0] if args.black_engine else "—"
-
-    gui = ChessGUI(white_name, black_name, engines_ready=engines_ready)
-
     state: dict = {
         "game": None, "thread": None, "stop": threading.Event(),
         "result": "*", "pgn": None,
@@ -1660,23 +1724,43 @@ Examples:
         "game_launched": False,
     }
 
-    # Start any engines supplied via args
-    def _start_engine(path, name):
+    def _start_engine(path, required: bool):
+        """Start an engine. Engines from the command line are required (exit on
+        failure); engines restored from last session are skipped if they fail."""
+        name = os.path.splitext(os.path.basename(path))[0]
         eng = UCIEngine(path, name)
         print(f"Starting {name}...")
         try:
             eng.start()
             print(f"  {name}: OK")
-        except RuntimeError as e:
-            sys.exit(f"Engine startup failed: {e}")
+        except Exception as e:
+            if required:
+                sys.exit(f"Engine startup failed: {e}")
+            print(f"  {name}: failed to start ({e}) — not restored")
+            try:
+                eng.quit()
+            except Exception:
+                pass
+            return None
         return eng
 
-    if args.white_engine:
-        state["white"] = _start_engine(args.white_engine, white_name)
-    if args.black_engine:
-        state["black"] = _start_engine(args.black_engine, black_name)
+    # Command-line engines take precedence; otherwise restore last session's
+    last = _load_last_engines()
+    for key, cli_path in (("white", args.white_engine), ("black", args.black_engine)):
+        if cli_path:
+            state[key] = _start_engine(cli_path, required=True)
+        elif last.get(key) and os.path.isfile(last[key]):
+            state[key] = _start_engine(last[key], required=False)
 
+    engines_ready = state["white"] is not None and state["black"] is not None
+    white_name = state["white"].name if state["white"] else "—"
+    black_name = state["black"].name if state["black"] else "—"
+
+    gui = ChessGUI(white_name, black_name, engines_ready=engines_ready)
     gui.set_engines(state["white"], state["black"])
+    if args.white_engine or args.black_engine:
+        # Remember command-line choices (don't overwrite on a failed restore)
+        _save_last_engines(state["white"], state["black"])
 
     def start_game():
         state["game_launched"] = True
@@ -1720,6 +1804,7 @@ Examples:
             if old:
                 old.quit()
             gui.set_engines(state["white"], state["black"])
+            _save_last_engines(state["white"], state["black"])
 
             both_ready = state["white"] is not None and state["black"] is not None
             if both_ready and not state["game_launched"]:
@@ -1741,6 +1826,7 @@ Examples:
         w_name = state["white"].name if state["white"] else "—"
         b_name = state["black"].name if state["black"] else "—"
         gui.set_engines(state["white"], state["black"])
+        _save_last_engines(state["white"], state["black"])
         gui.update(engine_changed=(chess.WHITE, w_name))
         gui.update(engine_changed=(chess.BLACK, b_name))
         restart()
@@ -1773,5 +1859,32 @@ Examples:
         print_summary(state["result"], state["white"], state["black"])
 
 
+def _show_error_dialog(msg: str):
+    """Show a fatal error in a message box (windowed build has no console)."""
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+        r = tk.Tk()
+        r.withdraw()
+        messagebox.showerror(f"Chess Player {__version__}", msg)
+        r.destroy()
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit as e:
+        if NO_CONSOLE and isinstance(e.code, str):
+            print(e.code, file=sys.stderr)
+            _show_error_dialog(e.code)
+            sys.exit(1)
+        raise
+    except Exception:
+        if NO_CONSOLE:
+            import traceback
+            traceback.print_exc()
+            _show_error_dialog("Unexpected error:\n\n" + traceback.format_exc(limit=5))
+            sys.exit(1)
+        raise

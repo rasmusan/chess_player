@@ -1,0 +1,10 @@
+__pycache__/
+.engine_history.json
+chess_player.log
+engines/
+
+# Build output
+.venv-build/
+build/
+dist/
+.last_engines.json
