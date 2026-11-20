@@ -8,8 +8,10 @@ Usage:
 Options:
     --w <path>           Path to engine playing White
     --b <path>           Path to engine playing Black
-    --time <sec>         Total time per player in seconds (default: 60)
-    --increment <sec>    Time increment per move in seconds (default: 0)
+    --time <sec>         Total time per player in seconds (default: 60, or the
+                         last setting from the GUI's ⚙ settings dialog)
+    --increment <sec>    Time increment per move in seconds (default: 0, or the
+                         last GUI setting)
     --nogui              Run without GUI (headless); --w and --b required
     --pgn <file>         Save game to PGN file
 """
@@ -113,6 +115,61 @@ def _save_last_engines(white, black):
             json.dump(d, f, indent=2)
     except OSError:
         pass
+
+
+# Time control settings (per side), edited via the ⚙ settings dialog
+_TIME_SETTINGS_FILE = os.path.join(DATA_DIR, ".time_settings.json")
+
+def _default_time_control(total: float = 60.0, inc: float = 0.0) -> dict:
+    return {"separate": False,
+            "white_time": total, "white_inc": inc,
+            "black_time": total, "black_inc": inc}
+
+def _load_time_settings() -> Optional[dict]:
+    try:
+        with open(_TIME_SETTINGS_FILE, encoding="utf-8-sig") as f:
+            d = json.load(f)
+        if not isinstance(d, dict):
+            return None
+        tc = _default_time_control()
+        tc["separate"] = bool(d.get("separate", False))
+        for k in ("white_time", "white_inc", "black_time", "black_inc"):
+            v = float(d.get(k, tc[k]))
+            if v < 0 or (k.endswith("_time") and v <= 0):
+                return None
+            tc[k] = v
+        return tc
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+        return None
+
+def _save_time_settings(tc: dict):
+    try:
+        with open(_TIME_SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(tc, f, indent=2)
+    except OSError:
+        pass
+
+
+def parse_duration(s: str) -> float:
+    """Parse '90', '1:30', '1:30.5' or '1:00:00' into seconds. Raises ValueError."""
+    s = s.strip()
+    if not s:
+        raise ValueError("empty")
+    total = 0.0
+    for part in s.split(":"):
+        total = total * 60 + float(part)
+    if total < 0:
+        raise ValueError("negative")
+    return total
+
+
+def fmt_duration(sec: float) -> str:
+    """Inverse of parse_duration for display in the settings dialog."""
+    sec = float(sec)
+    if sec < 60:
+        return f"{sec:g}"
+    m, s = divmod(sec, 60)
+    return f"{int(m)}:{s:02g}" if s == int(s) else f"{int(m)}:{s:04.1f}"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -399,6 +456,8 @@ class ChessGUI:
         self._game_started     = False
         self._change_engine_cb = None
         self._swap_cb = None
+        self._settings_get_cb   = None
+        self._settings_apply_cb = None
         self._engines_ready = engines_ready
         self._piece_imgs = self._load_pieces()
         self._anim_done  = threading.Event()
@@ -417,6 +476,167 @@ class ChessGUI:
 
     def set_swap_callback(self, cb):
         self._swap_cb = cb
+
+    def set_settings_callbacks(self, get_cb, apply_cb):
+        """get_cb() -> time-control dict; apply_cb(dict) stores/applies it."""
+        self._settings_get_cb   = get_cb
+        self._settings_apply_cb = apply_cb
+
+    @property
+    def game_in_progress(self) -> bool:
+        return self._game_started and not self._game_over
+
+    # ── Settings dialog (time control) ──
+
+    def _open_settings(self):
+        if not self._settings_get_cb:
+            return
+        tk  = self._tk
+        BG, FG, DIM = "#1a1a1a", "#cccccc", "#888888"
+        ENTRY = dict(font=("Consolas", 10), width=9, bg="#2e2e2e", fg="white",
+                     insertbackground="white", relief="flat",
+                     highlightthickness=1, highlightbackground="#444444",
+                     highlightcolor="#55aaff", justify="right")
+        tc = dict(self._settings_get_cb())
+
+        win = tk.Toplevel(self.root)
+        win.title("Settings")
+        win.configure(bg=BG, padx=18, pady=14)
+        win.resizable(False, False)
+        win.transient(self.root)
+
+        tk.Label(win, text="Time control", font=("Consolas", 12, "bold"),
+                 fg="white", bg=BG).grid(row=0, column=0, columnspan=3,
+                                         sticky="w", pady=(0, 10))
+
+        grid = tk.Frame(win, bg=BG)
+        grid.grid(row=1, column=0, columnspan=3, sticky="w")
+        tk.Label(grid, text="", bg=BG).grid(row=0, column=0)
+        tk.Label(grid, text="Time", font=("Consolas", 9), fg=DIM, bg=BG
+                 ).grid(row=0, column=1, sticky="e", padx=(10, 0))
+        tk.Label(grid, text="Increment", font=("Consolas", 9), fg=DIM, bg=BG
+                 ).grid(row=0, column=2, sticky="e", padx=(10, 0))
+
+        def _row(r, label, t, inc):
+            lbl = tk.Label(grid, text=label, font=("Consolas", 10), fg=FG, bg=BG,
+                           anchor="w", width=20)
+            te  = tk.Entry(grid, **ENTRY)
+            ie  = tk.Entry(grid, **ENTRY)
+            te.insert(0, fmt_duration(t))
+            ie.insert(0, f"{inc:g}")
+            lbl.grid(row=r, column=0, sticky="w", pady=3)
+            te.grid(row=r, column=1, padx=(10, 0), pady=3)
+            ie.grid(row=r, column=2, padx=(10, 0), pady=3)
+            return (lbl, te, ie)
+
+        both_row  = _row(1, "Both engines", tc["white_time"], tc["white_inc"])
+        white_row = _row(2, f"♙ {self.white_name[:17]}", tc["white_time"], tc["white_inc"])
+        black_row = _row(3, f"♟ {self.black_name[:17]}", tc["black_time"], tc["black_inc"])
+
+        sep_var = tk.BooleanVar(value=tc["separate"])
+
+        def _sync_rows(*_):
+            if sep_var.get():
+                for w in both_row:
+                    w.grid_remove()
+                for row in (white_row, black_row):
+                    for w in row:
+                        w.grid()
+            else:
+                for row in (white_row, black_row):
+                    for w in row:
+                        w.grid_remove()
+                for w in both_row:
+                    w.grid()
+
+        def _on_toggle():
+            if sep_var.get():
+                # Copy shared values into both per-engine rows
+                for _, te, ie in (white_row, black_row):
+                    te.delete(0, "end"); te.insert(0, both_row[1].get())
+                    ie.delete(0, "end"); ie.insert(0, both_row[2].get())
+            else:
+                # Collapse back to White's values
+                both_row[1].delete(0, "end"); both_row[1].insert(0, white_row[1].get())
+                both_row[2].delete(0, "end"); both_row[2].insert(0, white_row[2].get())
+            _sync_rows()
+
+        tk.Checkbutton(win, text="Different time per engine", variable=sep_var,
+                       command=_on_toggle, font=("Consolas", 10), fg=FG, bg=BG,
+                       selectcolor="#2e2e2e", activebackground=BG,
+                       activeforeground="white", cursor="hand2"
+                       ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+        tk.Label(win, text="Time: seconds or m:ss   Increment: seconds",
+                 font=("Consolas", 8), fg="#666666", bg=BG
+                 ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        note = ("Changes apply from the next game." if self.game_in_progress
+                else "")
+        msg = tk.Label(win, text=note, font=("Consolas", 9), fg="#ffaa44", bg=BG)
+        msg.grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        _sync_rows()
+
+        def _read(row, what):
+            _, te, ie = row
+            try:
+                t = parse_duration(te.get())
+                if t <= 0:
+                    raise ValueError
+            except ValueError:
+                raise ValueError(f"Invalid time for {what}: {te.get()!r}") from None
+            try:
+                i = float(ie.get().strip() or 0)
+                if i < 0:
+                    raise ValueError
+            except ValueError:
+                raise ValueError(f"Invalid increment for {what}: {ie.get()!r}") from None
+            return t, i
+
+        def _ok(event=None):
+            try:
+                if sep_var.get():
+                    wt, wi = _read(white_row, "White")
+                    bt, bi = _read(black_row, "Black")
+                else:
+                    wt, wi = _read(both_row, "both engines")
+                    bt, bi = wt, wi
+            except ValueError as e:
+                msg.config(text=str(e), fg="#ff5533")
+                return
+            new_tc = {"separate": sep_var.get(),
+                      "white_time": wt, "white_inc": wi,
+                      "black_time": bt, "black_inc": bi}
+            win.destroy()
+            if self._settings_apply_cb:
+                self._settings_apply_cb(new_tc)
+
+        def _cancel(event=None):
+            win.destroy()
+
+        bf = tk.Frame(win, bg=BG)
+        bf.grid(row=5, column=0, columnspan=3, sticky="e", pady=(12, 0))
+        tk.Button(bf, text="OK", font=("Consolas", 9),
+                  bg="#2a4a00", fg="#88ff44", relief="flat", padx=14, pady=4,
+                  activebackground="#3a6a00", activeforeground="#aaff66",
+                  cursor="hand2", command=_ok).pack(side="left", padx=(0, 8))
+        tk.Button(bf, text="Cancel", font=("Consolas", 9),
+                  bg="#3a3a3a", fg="#aaaaaa", relief="flat", padx=12, pady=4,
+                  activebackground="#555555", activeforeground="white",
+                  cursor="hand2", command=_cancel).pack(side="left")
+
+        win.bind("<Escape>", _cancel)
+        win.bind("<Return>", _ok)
+
+        # Centre over the main window, then make modal
+        win.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width()  - win.winfo_reqwidth())  // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - win.winfo_reqheight()) // 3
+        win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        win.grab_set()
+        (white_row if sep_var.get() else both_row)[1].focus_set()
+        win.wait_window()
 
     # ── Action button (Stop / Swap-colors) ──
 
@@ -639,7 +859,16 @@ class ChessGUI:
             state="normal" if self._engines_ready else "disabled",
             command=self._on_action_btn,
         )
-        self._action_btn.pack(side="left", padx=(0, 12))
+        self._action_btn.pack(side="left", padx=(0, 4))
+
+        # Settings (time control)
+        self._settings_btn = tk.Button(
+            bf, text="⚙", font=("Segoe UI Symbol", 14),
+            fg="#aaaaaa", bg="#3a3a3a", activebackground="#555555",
+            activeforeground="#cccccc", relief="flat", padx=10, pady=4,
+            cursor="hand2", command=self._open_settings,
+        )
+        self._settings_btn.pack(side="left", padx=(0, 12))
 
         # Log buttons — right side (pack Black first so it lands rightmost)
         self._log_btn_b = tk.Button(
@@ -1398,17 +1627,23 @@ class Game:
         gui: Optional[ChessGUI] = None,
         stop_event: Optional[threading.Event] = None,
         resume_event: Optional[threading.Event] = None,
+        black_time: Optional[float] = None,
+        black_increment: Optional[float] = None,
     ):
+        """total_time/increment apply to White (and to Black unless
+        black_time/black_increment are given)."""
         self.white        = white
         self.black        = black
-        self.total_time   = total_time
-        self.increment    = increment
+        self.white_total  = total_time
+        self.black_total  = total_time if black_time is None else black_time
+        self.white_inc    = increment
+        self.black_inc    = increment if black_increment is None else black_increment
         self.gui          = gui
         self.stop_event   = stop_event or threading.Event()
         self.resume_event = resume_event
         self.board      = chess.Board()
-        self.wtime      = total_time
-        self.btime      = total_time
+        self.wtime      = self.white_total
+        self.btime      = self.black_total
         self.white_eval: Optional[str] = None
         self.black_eval: Optional[str] = None
         self._move_texts: list[str]    = []
@@ -1441,7 +1676,11 @@ class Game:
         print(f"\n{sep}")
         print(f"  WHITE: {w}")
         print(f"  BLACK: {b}")
-        print(f"  Time : {self.total_time}s + {self.increment}s/move")
+        if (self.white_total, self.white_inc) == (self.black_total, self.black_inc):
+            print(f"  Time : {self.white_total:g}s + {self.white_inc:g}s/move")
+        else:
+            print(f"  Time : White {self.white_total:g}s + {self.white_inc:g}s/move, "
+                  f"Black {self.black_total:g}s + {self.black_inc:g}s/move")
         print(sep + "\n")
         print(board_ascii(self.board))
         print()
@@ -1494,7 +1733,8 @@ class Game:
 
             wms    = int(self.wtime * 1000)
             bms    = int(self.btime * 1000)
-            inc_ms = int(self.increment * 1000)
+            winc_ms = int(self.white_inc * 1000)
+            binc_ms = int(self.black_inc * 1000)
 
             color_str = "White" if turn == chess.WHITE else "Black"
             prefix    = f"  {move_num:3d}." if turn == chess.WHITE else "      "
@@ -1533,7 +1773,7 @@ class Game:
                     pass
 
             move_uci, score = engine.get_move(
-                self.board, wms, bms, inc_ms, inc_ms,
+                self.board, wms, bms, winc_ms, binc_ms,
                 hard_limit, info_callback=on_info, stop_event=self.stop_event,
             )
 
@@ -1544,10 +1784,10 @@ class Game:
             elapsed = time.monotonic() - t0
 
             if turn == chess.WHITE:
-                self.wtime = self.wtime - elapsed + self.increment
+                self.wtime = self.wtime - elapsed + self.white_inc
                 self.white_eval = score
             else:
-                self.btime = self.btime - elapsed + self.increment
+                self.btime = self.btime - elapsed + self.black_inc
                 self.black_eval = score
 
             self._gui(
@@ -1677,14 +1917,18 @@ Examples:
                         help="Path to engine playing White")
     parser.add_argument("--b",           dest="black_engine", metavar="PATH", default=None,
                         help="Path to engine playing Black")
-    parser.add_argument("--time", "-t",  type=float, default=60.0,  metavar="SEC")
-    parser.add_argument("--increment", "-i", type=float, default=0.0, metavar="SEC")
+    parser.add_argument("--time", "-t",  type=float, default=None,  metavar="SEC",
+                        help="Total time per player in seconds (default: 60, or last GUI setting)")
+    parser.add_argument("--increment", "-i", type=float, default=None, metavar="SEC",
+                        help="Increment per move in seconds (default: 0, or last GUI setting)")
     parser.add_argument("--nogui",       action="store_true", help="Run headless (no window)")
     parser.add_argument("--pgn",         type=str, default=None, metavar="FILE")
     parser.add_argument("--version", "-V", action="version", version=f"%(prog)s {__version__}")
     args = parser.parse_args()
 
     if args.nogui:
+        args.time = 60.0 if args.time is None else args.time
+        args.increment = 0.0 if args.increment is None else args.increment
         # Headless: both engines required
         if not args.white_engine or not args.black_engine:
             sys.exit("Error: --w and --b are required in --nogui mode")
@@ -1717,11 +1961,20 @@ Examples:
     if args.black_engine and not os.path.isfile(args.black_engine):
         sys.exit(f"Error: engine not found (--b): {args.black_engine}")
 
+    # Time control: saved GUI settings, overridden by --time / --increment
+    tc = _load_time_settings() or _default_time_control()
+    if args.time is not None or args.increment is not None:
+        tc = _default_time_control(
+            args.time if args.time is not None else tc["white_time"],
+            args.increment if args.increment is not None else tc["white_inc"],
+        )
+
     state: dict = {
         "game": None, "thread": None, "stop": threading.Event(),
         "result": "*", "pgn": None,
         "white": None, "black": None,
         "game_launched": False,
+        "tc": tc,
     }
 
     def _start_engine(path, required: bool):
@@ -1766,8 +2019,10 @@ Examples:
         state["game_launched"] = True
         stop = threading.Event()
         state["stop"] = stop
-        game = Game(state["white"], state["black"], args.time, args.increment, gui, stop,
-                    resume_event=gui._resume_event)
+        tc = state["tc"]
+        game = Game(state["white"], state["black"], tc["white_time"], tc["white_inc"],
+                    gui, stop, resume_event=gui._resume_event,
+                    black_time=tc["black_time"], black_increment=tc["black_inc"])
         state["game"] = game
 
         def run():
@@ -1831,6 +2086,15 @@ Examples:
         gui.update(engine_changed=(chess.BLACK, b_name))
         restart()
 
+    def apply_settings(new_tc: dict):
+        state["tc"] = new_tc
+        _save_time_settings(new_tc)
+        if gui.game_in_progress:
+            gui.update(status="Time control saved — applies from the next game")
+        elif state["game_launched"]:
+            restart()   # not started yet / game over: reload clocks now
+
+    gui.set_settings_callbacks(lambda: state["tc"], apply_settings)
     gui.set_restart_callback(restart)
     gui.set_swap_callback(swap_colors)
     gui.set_change_engine_callback(change_engine)
