@@ -30,7 +30,7 @@ import time
 from typing import Optional, Tuple
 
 # Single source of truth for the version. build.ps1 reads (and bumps) this line.
-__version__ = "1.0.1"
+__version__ = "1.2.1"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -183,7 +183,8 @@ class UCIEngine:
         self.process: Optional[subprocess.Popen] = None
         self._q: queue.Queue = queue.Queue()
         self.last_score: Optional[str] = None
-        self.last_depth: int = 0
+        self.last_depth: Optional[int] = None   # from UCI 'info depth', if reported
+        self.last_nodes: Optional[int] = None   # from UCI 'info nodes', if reported
         self.log: list[tuple[str, str]] = []   # (">"|"<", line)
         self.options: dict = {}                # name → {type, default, min, max, var, value}
 
@@ -261,7 +262,8 @@ class UCIEngine:
         self._send(f"go wtime {wtime_ms} btime {btime_ms} winc {winc_ms} binc {binc_ms}")
 
         self.last_score = None
-        self.last_depth = 0
+        self.last_depth = None
+        self.last_nodes = None
         deadline = time.monotonic() + hard_limit_s
 
         while time.monotonic() < deadline:
@@ -298,6 +300,8 @@ class UCIEngine:
 
     def _parse_info(self, line: str):
         parts = line.split()
+        if len(parts) > 1 and parts[1] == "string":
+            return   # free text; may contain words like 'depth'
         try:
             if "score" in parts:
                 idx  = parts.index("score")
@@ -309,6 +313,8 @@ class UCIEngine:
                     self.last_score = f"M{val}" if val > 0 else f"-M{abs(val)}"
             if "depth" in parts:
                 self.last_depth = int(parts[parts.index("depth") + 1])
+            if "nodes" in parts:
+                self.last_nodes = int(parts[parts.index("nodes") + 1])
         except (IndexError, ValueError):
             pass
 
@@ -412,6 +418,470 @@ def parse_eval(s: Optional[str]) -> Optional[float]:
         return None
 
 
+def fmt_count(v: float) -> str:
+    """1500 -> '1.5k', 2000000 -> '2M'."""
+    for div, suffix in ((1e9, "G"), (1e6, "M"), (1e3, "k")):
+        if v >= div:
+            return f"{v / div:g}{suffix}"
+    return f"{v:g}"
+
+
+# Metrics the graph panel can show, in display order (top to bottom)
+GRAPH_METRICS = ("eval", "depth", "nodes")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GUI / tournament settings
+# ──────────────────────────────────────────────────────────────────────────────
+
+_GUI_SETTINGS_FILE        = os.path.join(DATA_DIR, ".gui_settings.json")
+_TOURNAMENT_SETTINGS_FILE = os.path.join(DATA_DIR, ".tournament_settings.json")
+
+def _load_json_dict(path: str) -> dict:
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+def _save_json_dict(path: str, d: dict):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=2)
+    except OSError:
+        pass
+
+def _load_gui_settings() -> dict:
+    return _load_json_dict(_GUI_SETTINGS_FILE)
+
+def _save_gui_settings(update: dict):
+    d = _load_gui_settings()
+    d.update(update)
+    _save_json_dict(_GUI_SETTINGS_FILE, d)
+
+def _load_tournament_settings() -> dict:
+    return _load_json_dict(_TOURNAMENT_SETTINGS_FILE)
+
+def _save_tournament_settings(d: dict):
+    _save_json_dict(_TOURNAMENT_SETTINGS_FILE, d)
+
+
+def _write_json_atomic(path: str, d: dict):
+    """Write JSON via a temp file so a crash never leaves a half-written file.
+    Raises OSError."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, indent=2)
+    os.replace(tmp, path)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Game records — every finished game is saved as a PGN file in games/
+# ──────────────────────────────────────────────────────────────────────────────
+
+GAMES_DIR = os.path.join(DATA_DIR, "games")
+
+def _safe_filename(s: str, maxlen: int = 40) -> str:
+    out = "".join(ch if ch.isalnum() or ch in "._-+" else "_" for ch in s).strip("._")
+    return out[:maxlen] or "engine"
+
+def _save_game_record(pgn_game) -> Optional[str]:
+    """Save a finished game to GAMES_DIR. Returns the file path, or None."""
+    h = pgn_game.headers
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    base = f"{stamp}_{_safe_filename(h.get('White', '?'))}-vs-{_safe_filename(h.get('Black', '?'))}"
+    try:
+        os.makedirs(GAMES_DIR, exist_ok=True)
+        path = os.path.join(GAMES_DIR, base + ".pgn")
+        k = 2
+        while os.path.exists(path):
+            path = os.path.join(GAMES_DIR, f"{base}_{k}.pgn")
+            k += 1
+        with open(path, "w", encoding="utf-8") as fh:
+            print(pgn_game, file=fh, end="\n\n")
+        return path
+    except OSError as e:
+        print(f"  Could not save game record: {e}")
+        return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Tournament state files — the running tournament is autosaved after every
+# game and resumed on the next start; a stopped one can be saved to a file
+# ──────────────────────────────────────────────────────────────────────────────
+
+_CURRENT_TOURNAMENT_FILE = os.path.join(DATA_DIR, ".current_tournament.json")
+TOURNAMENTS_DIR          = os.path.join(DATA_DIR, "tournaments")
+_TOURNAMENT_STATE_VERSION = 1
+
+def _check_tournament_state(d) -> dict:
+    """Validate a tournament state dict (see run_tournament). Raises ValueError."""
+    if not isinstance(d, dict) or d.get("kind") != "chess_player tournament":
+        raise ValueError("not a chess_player tournament file")
+    if d.get("version") != _TOURNAMENT_STATE_VERSION:
+        raise ValueError(f"unsupported tournament file version: {d.get('version')!r}")
+    try:
+        engines = [{"name": str(e["name"]), "path": str(e["path"])} for e in d["engines"]]
+        t, inc = float(d["time"]), float(d["inc"])
+        tour = Tournament.from_dict(d["tournament"])
+    except (KeyError, TypeError, ValueError) as e:
+        raise ValueError(f"invalid tournament file ({e})") from None
+    if t <= 0 or inc < 0:
+        raise ValueError("invalid time control in tournament file")
+    if [e["name"] for e in engines] != tour.names:
+        raise ValueError("engine list does not match the tournament")
+    return {**d, "engines": engines, "time": t, "inc": inc}
+
+def _load_tournament_file(path: str, check_engines: bool = True) -> dict:
+    """Load and validate a saved tournament. Raises ValueError."""
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            d = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        raise ValueError(f"could not read {os.path.basename(path)}: {e}") from None
+    d = _check_tournament_state(d)
+    if check_engines:
+        for e in d["engines"]:
+            if not os.path.isfile(e["path"]):
+                raise ValueError(f"engine not found: {e['path']}")
+    return d
+
+def _remove_current_tournament():
+    try:
+        os.remove(_CURRENT_TOURNAMENT_FILE)
+    except OSError:
+        pass
+
+
+def _engine_candidates() -> list:
+    """Engines to offer in pickers: [(display_name, abs_path, source)] with the
+    engines/ folder first, then recently used engines from the history."""
+    engines_dir = os.path.join(APP_DIR, "engines")
+    items: list = []
+    seen: set = set()
+    if os.path.isdir(engines_dir):
+        for fname in sorted(os.listdir(engines_dir)):
+            fpath = os.path.join(engines_dir, fname)
+            if os.path.isfile(fpath) and not fname.startswith("."):
+                apath = os.path.abspath(fpath)
+                items.append((os.path.splitext(fname)[0], apath, "default"))
+                seen.add(apath)
+    for hpath in _load_engine_history():
+        apath = os.path.abspath(hpath)
+        if apath not in seen and os.path.isfile(apath):
+            name = os.path.splitext(os.path.basename(apath))[0]
+            items.append((f"{name}  ↩", apath, "recent"))
+            seen.add(apath)
+    return items
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Tournament logic (pairings, standings) — no engine or GUI code here
+# ──────────────────────────────────────────────────────────────────────────────
+
+_SHORT_REASON = {
+    "checkmate": "mate", "stalemate": "stalemate",
+    "insufficient material": "material", "threefold repetition": "3-fold",
+    "fivefold repetition": "5-fold", "fifty moves": "50-move",
+    "seventyfive moves": "75-move", "time forfeit": "time",
+    "no move": "no move", "illegal move": "illegal", "malformed move": "malformed",
+}
+
+def _game_points(result: str) -> Tuple[float, float]:
+    """(white points, black points) for a PGN result string."""
+    return {"1-0": (1.0, 0.0), "0-1": (0.0, 1.0), "1/2-1/2": (0.5, 0.5)}.get(result, (0.0, 0.0))
+
+
+class Tournament:
+    """
+    Round robin ("rr"):  `count` = number of rounds, i.e. full cycles in which
+                         every engine meets every other engine once. Colors
+                         are reversed in every second cycle.
+    Swiss ("swiss"):     `count` = number of matches per engine (Swiss rounds).
+                         Each round pairs engines with equal or similar scores
+                         who have not met yet, balancing colors. With an odd
+                         number of engines one gets a bye worth 1 point.
+
+    Tie-break: Sonneborn-Berger (SB) = sum of the final scores of the opponents
+    this engine beat, plus half the scores of the opponents it drew with.
+    """
+
+    def __init__(self, names: list, fmt: str, count: int):
+        if len(names) < 2:
+            raise ValueError("a tournament needs at least 2 engines")
+        if fmt not in ("rr", "swiss"):
+            raise ValueError(f"unknown tournament format: {fmt!r}")
+        self.names = list(names)
+        self.n     = len(names)
+        self.fmt   = fmt
+        self.count = max(1, int(count))
+        self.events: list = []   # chronological: {"type": "game"|"bye", ...}
+        self.current: Optional[Tuple[int, int, int]] = None   # (round, white, black)
+        # Swiss pairings per round, fixed once made (they depend on results,
+        # so a resumed tournament must not recompute a half-played round)
+        self._pairings: dict = {}
+        if fmt == "rr":
+            self._rr = self._round_robin_schedule()
+            self.total_rounds = len(self._rr)
+            self.total_games  = sum(len(pairs) for pairs, _ in self._rr)
+        else:
+            self.total_rounds = self.count
+            self.total_games  = self.count * (self.n // 2)
+
+    # ── Results ──
+
+    @property
+    def games(self) -> list:
+        return [e for e in self.events if e["type"] == "game"]
+
+    def record(self, rnd: int, white: int, black: int, result: str, reason: str = ""):
+        self.events.append({"type": "game", "round": rnd, "white": white,
+                            "black": black, "result": result, "reason": reason})
+
+    def record_bye(self, rnd: int, player: int):
+        self.events.append({"type": "bye", "round": rnd, "player": player})
+
+    def has_game(self, rnd: int, white: int, black: int) -> bool:
+        return any(e["type"] == "game" and (e["round"], e["white"], e["black"]) == (rnd, white, black)
+                   for e in self.events)
+
+    def has_bye(self, rnd: int) -> bool:
+        return any(e["type"] == "bye" and e["round"] == rnd for e in self.events)
+
+    # ── Persistence ──
+
+    def to_dict(self) -> dict:
+        return {"names": list(self.names), "format": self.fmt, "count": self.count,
+                "events": [dict(e) for e in self.events],
+                "pairings": {str(r): {"pairs": [list(p) for p in pairs], "bye": bye}
+                             for r, (pairs, bye) in self._pairings.items()}}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Tournament":
+        """Inverse of to_dict. Raises ValueError/KeyError/TypeError on bad data."""
+        t = cls([str(n) for n in d["names"]], d["format"], int(d["count"]))
+        idx = range(t.n)
+        for e in d.get("events", []):
+            rnd = int(e["round"])
+            if not 0 <= rnd < t.total_rounds:
+                raise ValueError(f"round out of range: {rnd}")
+            if e["type"] == "bye":
+                if int(e["player"]) not in idx:
+                    raise ValueError("bad bye player")
+                t.record_bye(rnd, int(e["player"]))
+            elif e["type"] == "game":
+                w, b = int(e["white"]), int(e["black"])
+                if w not in idx or b not in idx or w == b:
+                    raise ValueError("bad game players")
+                if e["result"] not in ("1-0", "0-1", "1/2-1/2"):
+                    raise ValueError(f"bad result: {e['result']!r}")
+                t.record(rnd, w, b, e["result"], str(e.get("reason", "")))
+            else:
+                raise ValueError(f"unknown event type: {e['type']!r}")
+        for r, p in (d.get("pairings") or {}).items():
+            pairs = [(int(a), int(b)) for a, b in p["pairs"]]
+            bye = None if p.get("bye") is None else int(p["bye"])
+            t._pairings[int(r)] = (pairs, bye)
+        return t
+
+    def score(self, i: int) -> float:
+        pts = 0.0
+        for e in self.events:
+            if e["type"] == "bye":
+                if e["player"] == i:
+                    pts += 1.0
+            elif i in (e["white"], e["black"]):
+                wp, bp = _game_points(e["result"])
+                pts += wp if e["white"] == i else bp
+        return pts
+
+    def sb(self, i: int) -> float:
+        """Sonneborn-Berger tie-break score."""
+        total = 0.0
+        for g in self.games:
+            if i not in (g["white"], g["black"]):
+                continue
+            wp, bp = _game_points(g["result"])
+            mine, opp = (wp, g["black"]) if g["white"] == i else (bp, g["white"])
+            total += mine * self.score(opp)
+        return total
+
+    def standings(self) -> list:
+        rows = []
+        for i, name in enumerate(self.names):
+            w = d = l = 0
+            for g in self.games:
+                if i not in (g["white"], g["black"]):
+                    continue
+                wp, bp = _game_points(g["result"])
+                mine = wp if g["white"] == i else bp
+                if mine == 1.0:
+                    w += 1
+                elif mine == 0.5:
+                    d += 1
+                else:
+                    l += 1
+            rows.append({"idx": i, "name": name, "games": w + d + l,
+                         "wins": w, "draws": d, "losses": l,
+                         "points": self.score(i), "sb": self.sb(i)})
+        rows.sort(key=lambda r: (-r["points"], -r["sb"], -r["wins"], r["idx"]))
+        # Shared rank when points and tie-break are both equal
+        for k, r in enumerate(rows):
+            prev = rows[k - 1] if k else None
+            same = prev and (prev["points"], prev["sb"]) == (r["points"], r["sb"])
+            r["rank"] = prev["rank"] if same else k + 1
+        return rows
+
+    # ── Pairings ──
+
+    def pairings(self, rnd: int) -> Tuple[list, Optional[int]]:
+        """([(white, black), ...], bye player or None) for round `rnd` (0-based).
+        Swiss pairings depend on earlier results: call once the previous round
+        is complete."""
+        if self.fmt == "rr":
+            pairs, bye = self._rr[rnd]
+            return list(pairs), bye
+        if rnd not in self._pairings:
+            self._pairings[rnd] = self._swiss_pairings(rnd)
+        pairs, bye = self._pairings[rnd]
+        return list(pairs), bye
+
+    def _round_robin_schedule(self) -> list:
+        """Circle method. Returns [(pairs, sitting_out_player)] per round."""
+        arr = list(range(self.n)) + ([None] if self.n % 2 else [])
+        m = len(arr)
+        cycle = []
+        balance = [0] * self.n   # whites minus blacks so far in the cycle
+        for k in range(m - 1):
+            pairs, bye = [], None
+            for i in range(m // 2):
+                a, b = arr[i], arr[m - 1 - i]
+                if a is None or b is None:
+                    bye = b if a is None else a
+                    continue
+                # White to whoever has had it less; alternate on a tie
+                if balance[a] != balance[b]:
+                    w, bl = (a, b) if balance[a] < balance[b] else (b, a)
+                else:
+                    w, bl = (a, b) if (k + i) % 2 == 0 else (b, a)
+                balance[w] += 1
+                balance[bl] -= 1
+                pairs.append((w, bl))
+            cycle.append((pairs, bye))
+            arr = [arr[0], arr[-1]] + arr[1:-1]
+        rounds = []
+        for c in range(self.count):
+            for pairs, bye in cycle:
+                rounds.append(([(b, a) for a, b in pairs] if c % 2 else list(pairs), bye))
+        return rounds
+
+    def _colors(self, i: int) -> list:
+        """Color history of player i: +1 = White, -1 = Black."""
+        out = []
+        for g in self.games:
+            if g["white"] == i:
+                out.append(1)
+            elif g["black"] == i:
+                out.append(-1)
+        return out
+
+    def _meetings(self) -> dict:
+        met: dict = {}
+        for g in self.games:
+            key = (min(g["white"], g["black"]), max(g["white"], g["black"]))
+            met[key] = met.get(key, 0) + 1
+        return met
+
+    def _swiss_pairings(self, rnd: int) -> Tuple[list, Optional[int]]:
+        order = sorted(range(self.n), key=lambda i: (-self.score(i), -self.sb(i), i))
+        bye = None
+        if self.n % 2:
+            had_bye = {e["player"] for e in self.events if e["type"] == "bye"}
+            bottom_up = [p for p in reversed(order) if p not in had_bye] or list(reversed(order))
+            bye = bottom_up[0]
+            order.remove(bye)
+
+        if rnd == 0:
+            # Top half vs bottom half, alternating colors by board
+            h = len(order) // 2
+            pairs = [(order[i], order[i + h]) if i % 2 == 0 else (order[i + h], order[i])
+                     for i in range(h)]
+            return pairs, bye
+
+        met = self._meetings()
+        # Avoid rematches; relax only when no pairing exists (more rounds
+        # than opponents), allowing at most `limit` earlier meetings per pair.
+        result = None
+        for limit in range(0, self.total_rounds + 1):
+            self._budget = 20000
+            result = self._pair_rec(order, met, limit)
+            if result is not None:
+                break
+        if result is None:   # unreachable in practice; fall back to adjacent pairs
+            result = [(order[i], order[i + 1]) for i in range(0, len(order) - 1, 2)]
+        return [self._assign_colors(a, b, rnd) for a, b in result], bye
+
+    def _pair_rec(self, order: list, met: dict, limit: int) -> Optional[list]:
+        if not order:
+            return []
+        p, rest = order[0], order[1:]
+        for j, q in enumerate(rest):
+            if met.get((min(p, q), max(p, q)), 0) > limit:
+                continue
+            self._budget -= 1
+            if self._budget < 0:
+                return None
+            sub = self._pair_rec(rest[:j] + rest[j + 1:], met, limit)
+            if sub is not None:
+                return [(p, q)] + sub
+        return None
+
+    def _assign_colors(self, a: int, b: int, rnd: int) -> Tuple[int, int]:
+        """a is the higher-ranked player. Returns (white, black)."""
+        ca, cb = self._colors(a), self._colors(b)
+        if sum(ca) != sum(cb):
+            return (a, b) if sum(ca) < sum(cb) else (b, a)
+        la, lb = (ca[-1] if ca else 0), (cb[-1] if cb else 0)
+        if la != lb:
+            return (a, b) if la < lb else (b, a)
+        return (a, b) if rnd % 2 == 0 else (b, a)
+
+    # ── Display ──
+
+    def snapshot(self, status: str, tc_text: str) -> dict:
+        """Plain-data view for the GUI. status: starting|running|finished|stopped."""
+        done = len(self.games)
+        rnd = (self.current[0] if self.current else
+               max((e["round"] for e in self.events), default=-1))
+        fmt_name = "Round robin" if self.fmt == "rr" else "Swiss"
+        results = []
+        for e in reversed(self.events):
+            if e["type"] == "bye":
+                results.append({"type": "bye", "round": e["round"] + 1,
+                                "name": self.names[e["player"]]})
+            else:
+                results.append({"type": "game", "round": e["round"] + 1,
+                                "white": self.names[e["white"]],
+                                "black": self.names[e["black"]],
+                                "result": e["result"],
+                                "reason": _SHORT_REASON.get(e["reason"], e["reason"])})
+        current = None
+        if self.current and status == "running":
+            current = (self.names[self.current[1]], self.names[self.current[2]])
+        return {
+            "title":    f"{fmt_name} · {self.n} engines",
+            "progress": (f"Round {max(rnd, 0) + 1}/{self.total_rounds} · "
+                         f"game {min(done + (1 if current else 0), self.total_games)}"
+                         f"/{self.total_games}"),
+            "tc":       tc_text,
+            "status":   status,
+            "current":  current,
+            "rows":     self.standings(),
+            "results":  results,
+        }
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # GUI
 # ──────────────────────────────────────────────────────────────────────────────
@@ -425,6 +895,7 @@ class ChessGUI:
     BG_IDLE = "#2b2b2b"
     BG_ACTV = "#3a5a00"
     GBG     = "#1a1a1a"   # graph background
+    GCARD   = "#222222"   # background of each graph card
     C_W     = "#ffffff"   # white-engine line
     C_B     = "#888888"   # black-engine line
 
@@ -440,8 +911,21 @@ class ChessGUI:
                 self.root.iconbitmap(default=ico)
             except tk.TclError:
                 pass
-        self.root.resizable(False, False)
+        self.root.resizable(True, True)
         self.root.configure(bg=self.BG_IDLE)
+        # Named fonts, so a font-size change in ⚙ settings updates every widget
+        self._fonts: dict = {}
+        try:
+            fs = int(_load_gui_settings().get("font_size", self.FONT_DEFAULT))
+        except (TypeError, ValueError):
+            fs = self.FONT_DEFAULT
+        self._font_size = max(self.FONT_MIN, min(self.FONT_MAX, fs))
+        # Board geometry; recomputed whenever the board canvas is resized
+        self._sq = self.SQ
+        self._bx = self._by = 0
+        self._cur_board = chess.Board()
+        self._cur_last: Optional[chess.Move] = None
+        self._animating = False
         self.white_name = white_name
         self.black_name = black_name
         self._uq: queue.Queue = queue.Queue()
@@ -459,10 +943,104 @@ class ChessGUI:
         self._settings_get_cb   = None
         self._settings_apply_cb = None
         self._engines_ready = engines_ready
-        self._piece_imgs = self._load_pieces()
+        # Tournament mode
+        self._tournament_running  = False
+        self._tournament_start_cb = None
+        self._tournament_stop_cb  = None
+        self._last_tournament_snap: Optional[dict] = None
+        # Graph panel: which metrics to show, and the last data drawn
+        sel = [m for m in _load_gui_settings().get("graph_metrics", ["eval"])
+               if m in GRAPH_METRICS]
+        self._graph_sel: set = set(sel or ["eval"])
+        self._graph_hist: dict = {}
+        self._piece_src  = self._load_pieces()   # PIL images at source size
+        self._piece_cache: dict = {}             # pixel size -> {(pt, white): PhotoImage}
+        self._piece_imgs = self._pieces_at(self._sq)
         self._anim_done  = threading.Event()
         self._build()
+        self._update_min_size()
         self._poll()
+
+    # ── Fonts ──
+
+    FONT_DEFAULT, FONT_MIN, FONT_MAX = 10, 7, 24
+
+    @property
+    def _scale(self) -> float:
+        return self._font_size / self.FONT_DEFAULT
+
+    def _font(self, size: int, weight: str = "normal", family: str = "Consolas"):
+        """Shared named font. `size` is the size at the default font setting."""
+        key = (family, size, weight)
+        f = self._fonts.get(key)
+        if f is None:
+            import tkinter.font as tkfont
+            f = tkfont.Font(root=self.root, family=family, weight=weight,
+                            size=max(6, round(size * self._scale)))
+            self._fonts[key] = f
+        return f
+
+    def set_font_size(self, size: int):
+        size = max(self.FONT_MIN, min(self.FONT_MAX, int(size)))
+        if size == self._font_size:
+            return
+        self._font_size = size
+        _save_gui_settings({"font_size": size})
+        for (_, base, _), f in self._fonts.items():
+            f.configure(size=max(6, round(base * self._scale)))
+        self._update_min_size()
+        self._layout()
+        self._draw_graph()
+        if self._last_tournament_snap:
+            self._render_tournament(self._last_tournament_snap)
+
+    # ── Window layout ──
+    # The content area (board column, graph, tournament panel) is laid out by
+    # hand with place(): the board takes the largest square that fits, the
+    # graph gets the remaining width, and the tournament panel a fixed width.
+
+    def _gw_min(self) -> int:
+        return round(self.GW * self._scale)
+
+    def _tw(self) -> int:
+        return round(self.TW * self._scale) if self._tpanel_shown else 0
+
+    def _update_min_size(self):
+        """Set the content's natural size (board at its default size) and use
+        the resulting window size as the minimum: the window can only grow."""
+        self.root.update_idletasks()
+        ph = self._bf.winfo_reqheight() + self._wf.winfo_reqheight()
+        self._content.config(width=8 * self.SQ + self._gw_min() + self._tw(),
+                             height=8 * self.SQ + ph)
+        self.root.update_idletasks()
+        self.root.minsize(self.root.winfo_reqwidth(), self.root.winfo_reqheight())
+
+    def _layout(self, event=None):
+        c = self._content
+        W, H = c.winfo_width(), c.winfo_height()
+        if W < 50 or H < 50:
+            return
+        ph = self._bf.winfo_reqheight() + self._wf.winfo_reqheight()
+        tw = self._tw()
+        bs = max(8 * 16, min(H - ph, W - tw - self._gw_min()))
+        gw = max(1, W - tw - bs)
+        top = max(0, (H - ph - bs) // 2)
+        self._left.place(x=0, y=top, width=bs, height=bs + ph)
+        self._right.place(x=bs, y=0, width=gw, height=H)
+        if tw:
+            self._tpanel.place(x=bs + gw, y=0, width=tw, height=H)
+        else:
+            self._tpanel.place_forget()
+
+    def _on_board_resize(self, event):
+        sq = max(16, min(event.width, event.height) // 8)
+        self._bx = (event.width - 8 * sq) // 2
+        self._by = (event.height - 8 * sq) // 2
+        if sq != self._sq:
+            self._sq = sq
+            self._piece_imgs = self._pieces_at(sq)
+        if not self._animating:
+            self._draw_board(self._cur_board, self._cur_last)
 
     def set_restart_callback(self, cb):
         self._restart_cb = cb
@@ -476,6 +1054,15 @@ class ChessGUI:
 
     def set_swap_callback(self, cb):
         self._swap_cb = cb
+
+    def set_tournament_callbacks(self, start_cb, stop_cb):
+        """start_cb(cfg dict) starts a tournament; stop_cb() aborts it."""
+        self._tournament_start_cb = start_cb
+        self._tournament_stop_cb  = stop_cb
+
+    @property
+    def tournament_running(self) -> bool:
+        return self._tournament_running
 
     def set_settings_callbacks(self, get_cb, apply_cb):
         """get_cb() -> time-control dict; apply_cb(dict) stores/applies it."""
@@ -493,7 +1080,7 @@ class ChessGUI:
             return
         tk  = self._tk
         BG, FG, DIM = "#1a1a1a", "#cccccc", "#888888"
-        ENTRY = dict(font=("Consolas", 10), width=9, bg="#2e2e2e", fg="white",
+        ENTRY = dict(font=self._font(10), width=9, bg="#2e2e2e", fg="white",
                      insertbackground="white", relief="flat",
                      highlightthickness=1, highlightbackground="#444444",
                      highlightcolor="#55aaff", justify="right")
@@ -505,20 +1092,20 @@ class ChessGUI:
         win.resizable(False, False)
         win.transient(self.root)
 
-        tk.Label(win, text="Time control", font=("Consolas", 12, "bold"),
+        tk.Label(win, text="Time control", font=self._font(12, "bold"),
                  fg="white", bg=BG).grid(row=0, column=0, columnspan=3,
                                          sticky="w", pady=(0, 10))
 
         grid = tk.Frame(win, bg=BG)
         grid.grid(row=1, column=0, columnspan=3, sticky="w")
         tk.Label(grid, text="", bg=BG).grid(row=0, column=0)
-        tk.Label(grid, text="Time", font=("Consolas", 9), fg=DIM, bg=BG
+        tk.Label(grid, text="Time", font=self._font(9), fg=DIM, bg=BG
                  ).grid(row=0, column=1, sticky="e", padx=(10, 0))
-        tk.Label(grid, text="Increment", font=("Consolas", 9), fg=DIM, bg=BG
+        tk.Label(grid, text="Increment", font=self._font(9), fg=DIM, bg=BG
                  ).grid(row=0, column=2, sticky="e", padx=(10, 0))
 
         def _row(r, label, t, inc):
-            lbl = tk.Label(grid, text=label, font=("Consolas", 10), fg=FG, bg=BG,
+            lbl = tk.Label(grid, text=label, font=self._font(10), fg=FG, bg=BG,
                            anchor="w", width=20)
             te  = tk.Entry(grid, **ENTRY)
             ie  = tk.Entry(grid, **ENTRY)
@@ -562,19 +1149,34 @@ class ChessGUI:
             _sync_rows()
 
         tk.Checkbutton(win, text="Different time per engine", variable=sep_var,
-                       command=_on_toggle, font=("Consolas", 10), fg=FG, bg=BG,
+                       command=_on_toggle, font=self._font(10), fg=FG, bg=BG,
                        selectcolor="#2e2e2e", activebackground=BG,
                        activeforeground="white", cursor="hand2"
                        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         tk.Label(win, text="Time: seconds or m:ss   Increment: seconds",
-                 font=("Consolas", 8), fg="#666666", bg=BG
+                 font=self._font(8), fg="#666666", bg=BG
                  ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         note = ("Changes apply from the next game." if self.game_in_progress
                 else "")
-        msg = tk.Label(win, text=note, font=("Consolas", 9), fg="#ffaa44", bg=BG)
+        msg = tk.Label(win, text=note, font=self._font(9), fg="#ffaa44", bg=BG)
         msg.grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        tk.Label(win, text="Display", font=self._font(12, "bold"),
+                 fg="white", bg=BG).grid(row=5, column=0, columnspan=3,
+                                         sticky="w", pady=(14, 6))
+        dfr = tk.Frame(win, bg=BG)
+        dfr.grid(row=6, column=0, columnspan=3, sticky="w")
+        tk.Label(dfr, text="Font size", font=self._font(10), fg=FG, bg=BG,
+                 anchor="w", width=20).pack(side="left")
+        font_var = tk.StringVar(value=str(self._font_size))
+        tk.Spinbox(dfr, from_=self.FONT_MIN, to=self.FONT_MAX, textvariable=font_var,
+                   width=5, font=self._font(10), bg="#2e2e2e", fg="white",
+                   relief="flat", buttonbackground="#3a3a3a",
+                   insertbackground="white", justify="right").pack(side="left", padx=(10, 0))
+        tk.Label(dfr, text=f"(default {self.FONT_DEFAULT})", font=self._font(9),
+                 fg=DIM, bg=BG).pack(side="left", padx=(8, 0))
 
         _sync_rows()
 
@@ -605,23 +1207,32 @@ class ChessGUI:
             except ValueError as e:
                 msg.config(text=str(e), fg="#ff5533")
                 return
+            try:
+                fsize = int(font_var.get())
+                if not self.FONT_MIN <= fsize <= self.FONT_MAX:
+                    raise ValueError
+            except ValueError:
+                msg.config(text=f"Font size must be {self.FONT_MIN}–{self.FONT_MAX}",
+                           fg="#ff5533")
+                return
             new_tc = {"separate": sep_var.get(),
                       "white_time": wt, "white_inc": wi,
                       "black_time": bt, "black_inc": bi}
             win.destroy()
-            if self._settings_apply_cb:
+            self.set_font_size(fsize)
+            if self._settings_apply_cb and new_tc != dict(self._settings_get_cb()):
                 self._settings_apply_cb(new_tc)
 
         def _cancel(event=None):
             win.destroy()
 
         bf = tk.Frame(win, bg=BG)
-        bf.grid(row=5, column=0, columnspan=3, sticky="e", pady=(12, 0))
-        tk.Button(bf, text="OK", font=("Consolas", 9),
+        bf.grid(row=7, column=0, columnspan=3, sticky="e", pady=(12, 0))
+        tk.Button(bf, text="OK", font=self._font(9),
                   bg="#2a4a00", fg="#88ff44", relief="flat", padx=14, pady=4,
                   activebackground="#3a6a00", activeforeground="#aaff66",
                   cursor="hand2", command=_ok).pack(side="left", padx=(0, 8))
-        tk.Button(bf, text="Cancel", font=("Consolas", 9),
+        tk.Button(bf, text="Cancel", font=self._font(9),
                   bg="#3a3a3a", fg="#aaaaaa", relief="flat", padx=12, pady=4,
                   activebackground="#555555", activeforeground="white",
                   cursor="hand2", command=_cancel).pack(side="left")
@@ -641,12 +1252,22 @@ class ChessGUI:
     # ── Action button (Stop / Swap-colors) ──
 
     def _update_action_btn(self):
-        if self._game_started and not self._game_over:
+        if self._tournament_running or (self._game_started and not self._game_over):
             self._action_btn.config(text="■", fg="#ff4444", activeforeground="#ff6666")
         else:
             self._action_btn.config(text="⇆", fg="#aaaaaa", activeforeground="#cccccc")
 
     def _on_action_btn(self):
+        if self._tournament_running:
+            if self._resume_event.is_set():
+                self._resume_event.clear()
+                self._play_btn.config(text="▶", fg="#88ff44")
+            stop = self._tournament_stop_cb or (lambda save: None)
+            self._open_stop_confirm(
+                "Stop the tournament?\nSave it to a file to continue it later.",
+                "Stop", lambda: stop(False), title="Stop tournament",
+                alt=("Stop and save…", lambda: stop(True)))
+            return
         if self._game_started and not self._game_over:
             if self._resume_event.is_set():
                 self._resume_event.clear()
@@ -656,42 +1277,60 @@ class ChessGUI:
             if self._swap_cb:
                 self._swap_cb()
 
-    def _open_stop_confirm(self):
+    def _open_stop_confirm(self, text="Stop and reset the current game?",
+                           yes_text="Reset", on_yes=None, title="Stop game", alt=None):
+        """alt: optional (label, callback) for a second confirm button."""
+        on_yes = on_yes or self._restart_cb
         tk  = self._tk
         win = tk.Toplevel(self.root)
-        win.title("Stop game")
-        win.configure(bg="#1a1a1a")
-        win.geometry("280x120")
+        win.title(title)
+        win.configure(bg="#1a1a1a", padx=24, pady=18)
         win.resizable(False, False)
         win.transient(self.root)
         win.grab_set()
 
-        tk.Label(win, text="Stop and reset the current game?",
-                 font=("Consolas", 10), fg="#cccccc", bg="#1a1a1a").pack(pady=(22, 14))
+        tk.Label(win, text=text, justify="center",
+                 font=self._font(10), fg="#cccccc", bg="#1a1a1a").pack(pady=(4, 14))
 
         bf = tk.Frame(win, bg="#1a1a1a")
         bf.pack()
 
         def _yes():
             win.destroy()
-            if self._restart_cb:
-                self._restart_cb()
+            if on_yes:
+                on_yes()
 
         def _no():
             win.destroy()
 
-        tk.Button(bf, text="Reset", font=("Consolas", 9),
+        if alt:
+            def _alt():
+                win.destroy()
+                alt[1]()
+            tk.Button(bf, text=alt[0], font=self._font(9),
+                      bg="#2a4a00", fg="#88ff44", relief="flat", padx=12, pady=4,
+                      activebackground="#3a6a00", activeforeground="#aaff66",
+                      cursor="hand2", command=_alt).pack(side="left", padx=(0, 8))
+
+        tk.Button(bf, text=yes_text, font=self._font(9),
                   bg="#5a1500", fg="#ff5533", relief="flat", padx=12, pady=4,
                   activebackground="#7a2000", activeforeground="#ff7755",
                   cursor="hand2", command=_yes).pack(side="left", padx=(0, 8))
-        tk.Button(bf, text="Cancel", font=("Consolas", 9),
+        tk.Button(bf, text="Cancel", font=self._font(9),
                   bg="#3a3a3a", fg="#aaaaaa", relief="flat", padx=12, pady=4,
                   activebackground="#555555", activeforeground="white",
                   cursor="hand2", command=_no).pack(side="left")
 
         win.bind("<Escape>", lambda e: _no())
         win.bind("<Return>",  lambda e: _yes())
+        self._center_dialog(win)
         win.wait_window()
+
+    def _center_dialog(self, win):
+        win.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width()  - win.winfo_reqwidth())  // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - win.winfo_reqheight()) // 3
+        win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
 
     # ── Piece image loading ──
 
@@ -733,24 +1372,38 @@ class ChessGUI:
             transparent = Image.merge('RGBA', (r, g, b, alpha))
 
         cw, ch = W // 6, H // 2
-        sz = self.SQ - 14
         order = [chess.KING, chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT, chess.PAWN]
-        imgs = {}
+        src = {}
         for row, is_white in enumerate([True, False]):
             for col, pt in enumerate(order):
                 cell = transparent.crop((col * cw, row * ch, (col + 1) * cw, (row + 1) * ch))
                 # Crop to the tight bounding box of non-transparent pixels so that
                 # empty cell margins (which vary per piece) don't affect centering.
                 bbox = cell.getbbox()
-                piece = cell.crop(bbox) if bbox else cell
-                # Scale proportionally to fit within sz×sz.
-                piece.thumbnail((sz, sz), Image.LANCZOS)
-                # Centre on a transparent sz×sz canvas.
-                canvas = Image.new('RGBA', (sz, sz), (0, 0, 0, 0))
-                ox = (sz - piece.width) // 2
-                oy = (sz - piece.height) // 2
-                canvas.paste(piece, (ox, oy), piece)
-                imgs[(pt, is_white)] = ImageTk.PhotoImage(canvas)
+                src[(pt, is_white)] = cell.crop(bbox) if bbox else cell
+        return src
+
+    def _pieces_at(self, sq: int):
+        """PhotoImages for square size `sq`, scaled from the sprite sheet."""
+        if not self._piece_src:
+            return None
+        if sq in self._piece_cache:
+            return self._piece_cache[sq]
+        from PIL import Image, ImageTk
+        sz = max(8, round(sq * 54 / 68))   # piece size relative to the square
+        imgs = {}
+        for key, piece in self._piece_src.items():
+            p = piece.copy()
+            # Scale proportionally to fit within sz×sz, centred on a transparent canvas
+            p.thumbnail((sz, sz), Image.LANCZOS)
+            canvas = Image.new('RGBA', (sz, sz), (0, 0, 0, 0))
+            canvas.paste(p, ((sz - p.width) // 2, (sz - p.height) // 2), p)
+            imgs[key] = ImageTk.PhotoImage(canvas)
+        # Keep only a few sizes (resizing the window passes through many)
+        if len(self._piece_cache) >= 4:
+            for k in [k for k in self._piece_cache if k not in (self.SQ, self._sq)][:2]:
+                del self._piece_cache[k]
+        self._piece_cache[sq] = imgs
         return imgs
 
     # ── Layout ──
@@ -765,79 +1418,90 @@ class ChessGUI:
         SQ = self.SQ
         px = SQ * 8   # board pixel size
 
-        # ── Main content: board column + graph column ──
-        content = tk.Frame(r, bg=self.BG_IDLE)
-        content.pack(fill="both")
+        # ── Main content: board column + graph column (+ tournament panel) ──
+        # Packed last (below) so that the bars at the bottom keep their height
+        # and the content area absorbs any change of window size.
+        content = tk.Frame(r, bg=self.BG_IDLE, width=px + self.GW, height=px + 100)
+        self._content = content
+        content.bind("<Configure>", self._layout)
 
         left = tk.Frame(content, bg=self.BG_IDLE)
-        left.pack(side="left")
+        self._left = left
 
         right = tk.Frame(content, bg=self.GBG)
-        right.pack(side="left", fill="y")
+        self._right = right
+
+        # Tournament panel: placed to the right of the graph only in tournament mode
+        self._build_tournament_panel(content)
 
         # ── Player panels ──
         def player_panel(parent, name, symbol):
             f  = tk.Frame(parent, bg=self.BG_IDLE, pady=8, padx=10)
             f.pack(fill="x")
-            nm = self._lbl(f, f"{symbol} {name}", ("Consolas", 13, "bold"))
+            nm = self._lbl(f, f"{symbol} {name}", self._font(13, "bold"))
             nm.pack(side="left")
-            ev = self._lbl(f, "eval: ---", ("Consolas", 11), fg="#aaaaaa")
+            ev = self._lbl(f, "eval: ---", self._font(11), fg="#aaaaaa")
             ev.pack(side="right", padx=14)
-            tm = self._lbl(f, "--:--.-", ("Consolas", 16, "bold"), fg="#55aaff")
+            tm = self._lbl(f, "--:--.-", self._font(16, "bold"), fg="#55aaff")
             tm.pack(side="right")
             return f, nm, tm, ev
 
         self._bf, self._bn, self._bt, self._be = player_panel(left, self.black_name, "♟")
 
-        self._canvas = tk.Canvas(left, width=px, height=px, highlightthickness=0)
-        self._canvas.pack()
-
+        self._canvas = tk.Canvas(left, width=px, height=px, highlightthickness=0,
+                                 bg=self.BG_IDLE)
         self._wf, self._wn, self._wt, self._we = player_panel(left, self.white_name, "♙")
+        # White's panel is packed before the canvas so it keeps its height
+        self._wf.pack_configure(side="bottom")
+        self._canvas.pack(fill="both", expand=True)
+        self._canvas.bind("<Configure>", self._on_board_resize)
 
         # Make name labels clickable when idle (game over or not yet started)
         for lbl, color in ((self._bn, chess.BLACK), (self._wn, chess.WHITE)):
             lbl.config(cursor="hand2")
             lbl.bind("<Button-1>", lambda e, c=color: self._on_name_click(c))
 
-        # ── Eval graph ──
-        self._gcv = tk.Canvas(right, width=self.GW, height=px,
+        # ── Graph panel: metric selector + canvas ──
+        self._build_graph_selector(right)
+        self._gcv = tk.Canvas(right, width=self.GW, height=px - 30,
                               bg=self.GBG, highlightthickness=0)
         self._gcv.pack(fill="both", expand=True)
+        self._gcv.bind("<Configure>", lambda e: self._draw_graph())
+
+        # ── Bottom bars, packed bottom-up: buttons, move list, status ──
+        bf = tk.Frame(r, bg="#222222", pady=6, padx=10)
+        bf.pack(side="bottom", fill="x")
+        mf = tk.Frame(r, bg="#111111", pady=4, padx=10)
+        mf.pack(side="bottom", fill="x")
+        sf = tk.Frame(r, bg="#1a1a1a", pady=5, padx=10)
+        sf.pack(side="bottom", fill="x")
+        content.pack(side="top", fill="both", expand=True)
 
         # ── Status bar ──
-        sf = tk.Frame(r, bg="#1a1a1a", pady=5, padx=10)
-        sf.pack(fill="x")
         _init_status = ("Click the player names to select engines"
                         if not self._engines_ready else "Initialising...")
-        self._status = self._lbl(sf, _init_status, ("Consolas", 11),
+        self._status = self._lbl(sf, _init_status, self._font(11),
                                  fg="#cccccc", bg="#1a1a1a")
         self._status.pack(side="left")
-        self._last_move_lbl = self._lbl(sf, "", ("Consolas", 11, "bold"),
+        self._last_move_lbl = self._lbl(sf, "", self._font(11, "bold"),
                                         fg="#ffaa00", bg="#1a1a1a")
         self._last_move_lbl.pack(side="right")
 
-        # ── Move list ──
-        mf = tk.Frame(r, bg="#111111", pady=4, padx=10)
-        mf.pack(fill="x")
-        self._moves_lbl = self._lbl(mf, "", ("Consolas", 10), fg="#aaaaaa",
-                                    bg="#111111", wraplength=px + self.GW - 20)
+        # ── Move list (wraps at the window width) ──
+        self._moves_lbl = self._lbl(mf, "", self._font(10), fg="#aaaaaa",
+                                    bg="#111111", wraplength=px + self.GW - 20,
+                                    justify="left")
         self._moves_lbl.pack(side="left")
+        mf.bind("<Configure>", lambda e: self._moves_lbl.config(
+            wraplength=max(100, e.width - 20)))
 
         # ── Button bar ──
-        bf = tk.Frame(r, bg="#222222", pady=6, padx=10)
-        bf.pack(fill="x")
-
-        def _mk_btn(parent, text, font, fg, cmd, padx=(0, 6)):
-            b = tk.Button(parent, text=text, font=font, fg=fg,
-                          bg="#3a3a3a", activebackground="#555555",
-                          activeforeground=fg, relief="flat",
-                          padx=10, pady=4, cursor="hand2", command=cmd)
-            b.pack(side="left", padx=padx)
-            return b
+        # All buttons fill the bar's height, so text buttons line up with the
+        # larger symbol buttons.
 
         # Play / Pause
         self._play_btn = tk.Button(
-            bf, text="▶", font=("Segoe UI Symbol", 14),
+            bf, text="▶", font=self._font(14, family="Segoe UI Symbol"),
             fg="#88ff44" if self._engines_ready else "#555555",
             bg="#3a3a3a", activebackground="#555555", activeforeground="#88ff44",
             relief="flat", padx=10, pady=4,
@@ -846,11 +1510,11 @@ class ChessGUI:
             state="normal" if self._engines_ready else "disabled",
             command=self._on_play_pause,
         )
-        self._play_btn.pack(side="left", padx=(0, 4))
+        self._play_btn.pack(side="left", fill="y", padx=(0, 4))
 
         # Stop / Swap-colors
         self._action_btn = tk.Button(
-            bf, text="⇆", font=("Segoe UI Symbol", 14),
+            bf, text="⇆", font=self._font(14, family="Segoe UI Symbol"),
             fg="#aaaaaa" if self._engines_ready else "#555555",
             bg="#3a3a3a", activebackground="#555555", activeforeground="#cccccc",
             relief="flat", padx=10, pady=4,
@@ -859,50 +1523,62 @@ class ChessGUI:
             state="normal" if self._engines_ready else "disabled",
             command=self._on_action_btn,
         )
-        self._action_btn.pack(side="left", padx=(0, 4))
+        self._action_btn.pack(side="left", fill="y", padx=(0, 4))
 
         # Settings (time control)
         self._settings_btn = tk.Button(
-            bf, text="⚙", font=("Segoe UI Symbol", 14),
+            bf, text="⚙", font=self._font(14, family="Segoe UI Symbol"),
             fg="#aaaaaa", bg="#3a3a3a", activebackground="#555555",
             activeforeground="#cccccc", relief="flat", padx=10, pady=4,
             cursor="hand2", command=self._open_settings,
         )
-        self._settings_btn.pack(side="left", padx=(0, 12))
+        self._settings_btn.pack(side="left", fill="y", padx=(0, 4))
+
+        # Tournament setup
+        self._tourn_btn = tk.Button(
+            bf, text="♛ Tournament", font=self._font(10, family="Segoe UI Symbol"),
+            fg="#ffcc44", bg="#3a3a3a", activebackground="#555555",
+            activeforeground="#ffdd66", disabledforeground="#555555",
+            relief="flat", padx=10, pady=4, cursor="hand2",
+            command=self._open_tournament_dialog,
+        )
+        self._tourn_btn.pack(side="left", fill="y", padx=(0, 12))
 
         # Log buttons — right side (pack Black first so it lands rightmost)
         self._log_btn_b = tk.Button(
-            bf, text=f"☰  {self.black_name[:14]}", font=("Segoe UI Symbol", 10),
+            bf, text=f"☰  {self.black_name[:14]}", font=self._font(10, family="Segoe UI Symbol"),
             fg="#ffffff", bg="#3a3a3a", activebackground="#555555",
             activeforeground="#ffffff", relief="flat", padx=10, pady=4,
             cursor="hand2", command=lambda: self._open_log_window(self._black_engine),
         )
-        self._log_btn_b.pack(side="right", padx=(0, 6))
+        self._log_btn_b.pack(side="right", fill="y", padx=(0, 6))
         self._log_btn_w = tk.Button(
-            bf, text=f"☰  {self.white_name[:14]}", font=("Segoe UI Symbol", 10),
+            bf, text=f"☰  {self.white_name[:14]}", font=self._font(10, family="Segoe UI Symbol"),
             fg="#ffffff", bg="#3a3a3a", activebackground="#555555",
             activeforeground="#ffffff", relief="flat", padx=10, pady=4,
             cursor="hand2", command=lambda: self._open_log_window(self._white_engine),
         )
-        self._log_btn_w.pack(side="right", padx=(0, 6))
+        self._log_btn_w.pack(side="right", fill="y", padx=(0, 6))
 
 
         self._draw_board(chess.Board())
-        self._draw_graph([], [])
+        self._draw_graph({})
 
     # ── Board drawing ──
 
     def _draw_board(self, board: chess.Board, last_move: Optional[chess.Move] = None):
+        self._cur_board, self._cur_last = board.copy(stack=False), last_move
         c  = self._canvas
-        SQ = self.SQ
+        SQ = self._sq
+        X0, Y0 = self._bx, self._by
         c.delete("all")
         hi = {last_move.from_square, last_move.to_square} if last_move else set()
 
         for rank in range(8):
             for file in range(8):
                 sq    = chess.square(file, rank)
-                x1    = file * SQ
-                y1    = (7 - rank) * SQ
+                x1    = X0 + file * SQ
+                y1    = Y0 + (7 - rank) * SQ
                 light = (file + rank) % 2 == 1
                 col   = self.HI if sq in hi else (self.LIGHT if light else self.DARK)
                 c.create_rectangle(x1, y1, x1 + SQ, y1 + SQ, fill=col, outline="")
@@ -916,11 +1592,7 @@ class ChessGUI:
                     else:
                         self._draw_piece(c, cx, cy, SQ, piece)
 
-        for i in range(8):
-            c.create_text(3, (7 - i) * SQ + SQ // 2, text=str(i + 1),
-                          font=("Consolas", 8), fill="#666", anchor="w")
-            c.create_text(i * SQ + SQ // 2, 8 * SQ - 2, text="abcdefgh"[i],
-                          font=("Consolas", 8), fill="#666", anchor="s")
+        self._draw_coords(c, SQ, X0, Y0)
 
     # ── Move animation ──
 
@@ -940,6 +1612,7 @@ class ChessGUI:
         self._anim_board = board_before
         self._anim_move  = move
         self._anim_start = time.monotonic()
+        self._animating  = True
         self._anim_step()
 
     def _anim_step(self):
@@ -949,12 +1622,21 @@ class ChessGUI:
         if t < 1.0:
             self.root.after(16, self._anim_step)
         else:
+            self._animating = False
             self._anim_done.set()
+
+    def _draw_coords(self, c, SQ: int, X0: int, Y0: int):
+        for i in range(8):
+            c.create_text(X0 + 3, Y0 + (7 - i) * SQ + SQ // 2, text=str(i + 1),
+                          font=self._font(8), fill="#666", anchor="w")
+            c.create_text(X0 + i * SQ + SQ // 2, Y0 + 8 * SQ - 2, text="abcdefgh"[i],
+                          font=self._font(8), fill="#666", anchor="s")
 
     def _draw_board_anim(self, board: chess.Board, move: chess.Move, t: float):
         """Board with the moving piece interpolated at progress t (0→from, 1→to)."""
         c  = self._canvas
-        SQ = self.SQ
+        SQ = self._sq
+        X0, Y0 = self._bx, self._by
         c.delete("all")
         hi     = {move.from_square, move.to_square}
         moving = board.piece_at(move.from_square)
@@ -962,8 +1644,8 @@ class ChessGUI:
         for rank in range(8):
             for file in range(8):
                 sq    = chess.square(file, rank)
-                x1    = file * SQ
-                y1    = (7 - rank) * SQ
+                x1    = X0 + file * SQ
+                y1    = Y0 + (7 - rank) * SQ
                 light = (file + rank) % 2 == 1
                 col   = self.HI if sq in hi else (self.LIGHT if light else self.DARK)
                 c.create_rectangle(x1, y1, x1 + SQ, y1 + SQ, fill=col, outline="")
@@ -976,19 +1658,15 @@ class ChessGUI:
                     else:
                         self._draw_piece(c, cx2, cy2, SQ, piece)
 
-        for i in range(8):
-            c.create_text(3, (7 - i) * SQ + SQ // 2, text=str(i + 1),
-                          font=("Consolas", 8), fill="#666", anchor="w")
-            c.create_text(i * SQ + SQ // 2, 8 * SQ - 2, text="abcdefgh"[i],
-                          font=("Consolas", 8), fill="#666", anchor="s")
+        self._draw_coords(c, SQ, X0, Y0)
 
         if moving:
             ff = chess.square_file(move.from_square)
             fr = chess.square_rank(move.from_square)
             tf = chess.square_file(move.to_square)
             tr = chess.square_rank(move.to_square)
-            px = (ff + 0.5) * SQ + t * ((tf - ff) * SQ)
-            py = (7 - fr + 0.5) * SQ + t * ((fr - tr) * SQ)
+            px = X0 + (ff + 0.5) * SQ + t * ((tf - ff) * SQ)
+            py = Y0 + (7 - fr + 0.5) * SQ + t * ((fr - tr) * SQ)
             img = self._piece_imgs and self._piece_imgs.get((moving.piece_type, moving.color))
             if img:
                 c.create_image(int(px), int(py), image=img, anchor='center')
@@ -1062,79 +1740,183 @@ class ChessGUI:
             R(-2, -30,  2, -18)              # cross vertical
             R(-7, -27,  7, -23)              # cross horizontal
 
-    # ── Eval graph ──
+    # ── Graph panel (eval / depth / nodes) ──
 
-    def _draw_graph(self, w_evals: list, b_evals: list):
-        """
-        w_evals, b_evals: parallel lists normalised to White's POV.
-        Y-axis is inverted: top = black ahead (negative), bottom = white ahead (positive).
-        Scale auto-fits to current data, always spanning at least ±1, capped at ±10.
-        """
-        c  = self._gcv
-        W  = self.GW
-        H  = max(c.winfo_height(), self.SQ * 8)
-        c.delete("all")
+    GRAPH_TITLES = {"eval": "Evaluation", "depth": "Search depth",
+                    "nodes": "Nodes searched (log)"}
 
-        ML, MR, MT, MB = 38, 10, 22, 52
-        pw = W - ML - MR
-        ph = H - MT - MB
+    def _build_graph_selector(self, parent):
+        tk  = self._tk
+        bar = tk.Frame(parent, bg=self.GBG, pady=5)
+        bar.pack(fill="x")
+        tk.Label(bar, text="Show:", font=self._font(9), fg="#777777",
+                 bg=self.GBG).pack(side="left", padx=(8, 4))
+        self._graph_btns = {}
+        for m, label in (("eval", "Eval"), ("depth", "Depth"), ("nodes", "Nodes")):
+            b = tk.Label(bar, text=label, font=self._font(9, "bold"),
+                         padx=8, pady=2, cursor="hand2")
+            b.pack(side="left", padx=2)
+            b.bind("<Button-1>", lambda e, m=m: self._toggle_graph_metric(m))
+            self._graph_btns[m] = b
+        self._style_graph_btns()
 
-        c.create_rectangle(0, 0, W, H, fill=self.GBG, outline="")
-        c.create_text(W // 2, 10, text="Evaluation", fill="#777",
-                      font=("Consolas", 8, "bold"), anchor="center")
+    def _style_graph_btns(self):
+        for m, b in self._graph_btns.items():
+            on = m in self._graph_sel
+            b.config(bg="#3a3a3a" if on else self.GBG,
+                     fg="#ffffff" if on else "#666666")
 
-        # Auto-scale: always include ±1, outer limit ±10
-        all_vals = [v for v in w_evals + b_evals if v is not None]
-        if all_vals:
-            y_max = min(10.0, max(1.0,  max(all_vals)))
-            y_min = max(-10.0, min(-1.0, min(all_vals)))
+    def _toggle_graph_metric(self, metric: str):
+        if metric in self._graph_sel:
+            if len(self._graph_sel) == 1:
+                return   # keep at least one graph
+            self._graph_sel.discard(metric)
         else:
-            y_min, y_max = -1.0, 1.0
+            self._graph_sel.add(metric)
+        self._style_graph_btns()
+        _save_gui_settings({"graph_metrics": [m for m in GRAPH_METRICS
+                                              if m in self._graph_sel]})
+        self._draw_graph()
 
-        # Inverted y: negative (black ahead) → screen top, positive (white ahead) → screen bottom
-        def gy(v):
-            v = max(y_min, min(y_max, float(v)))
-            return MT + ph * (v - y_min) / (y_max - y_min)
+    def _draw_graph(self, hist: Optional[dict] = None):
+        """
+        hist: metric -> (white_values, black_values), parallel per-ply lists
+        with None on the other side's plies and where the engine reported
+        nothing. Evals are normalised to White's POV. hist=None redraws the
+        last data (after toggling metrics or a resize).
+        The selected metrics are stacked top to bottom with a shared legend.
+        """
+        if hist is not None:
+            self._graph_hist = hist
+        c = self._gcv
+        W = c.winfo_width()
+        H = c.winfo_height()
+        if H < 50 or W < 50:   # not mapped yet
+            W, H = int(c.cget("width")), int(c.cget("height"))
+        self._gw_now = W
+        k = self._scale
+        c.delete("all")
+        c.create_rectangle(0, 0, W, H, fill=self.GBG, outline="")
 
-        n = max(len(w_evals), len(b_evals), 1)
+        metrics = [m for m in GRAPH_METRICS if m in self._graph_sel] or ["eval"]
+        LEG = round(50 * k)
+        GAP = round(12 * k)   # space between the graph cards
+        sec = (H - LEG - GAP * (len(metrics) - 1)) / len(metrics)
+        for j, m in enumerate(metrics):
+            w_vals, b_vals = self._graph_hist.get(m, ([], []))
+            self._plot_metric(m, j * (sec + GAP), sec, w_vals, b_vals)
+
+        # Legend — Black on top, White below (mirrors board orientation)
+        ML = round(44 * k)
+        for y_off, color, label in [
+            (H - LEG + 16 * k, self.C_B, f"B: {self.black_name[:24]}"),
+            (H - LEG + 36 * k, self.C_W, f"W: {self.white_name[:24]}"),
+        ]:
+            c.create_line(ML, y_off, ML + 16, y_off, fill=color, width=2)
+            c.create_text(ML + 20, y_off, text=label, fill=color,
+                          font=self._font(10), anchor="w")
+
+    def _plot_metric(self, metric: str, top: float, height: float,
+                     w_vals: list, b_vals: list):
+        """
+        eval:  y inverted (top = Black ahead), auto-scaled, at least ±1, capped ±10
+        depth: linear from 0
+        nodes: log10 scale
+        """
+        import math
+        c = self._gcv
+        k = self._scale
+        INSET = 6   # card edge to window edge
+        ML, MR, MT, MB = round(44 * k), 16, round(26 * k), 10
+        pw = max(10, self._gw_now - ML - MR)
+        y0 = top + MT
+        ph = max(10.0, height - MT - MB)
+        MIN_GAP = 16 * k   # min px between labelled gridlines
+
+        # Each graph is a card of its own: lighter background, border, title bar
+        c.create_rectangle(INSET, top, self._gw_now - INSET, top + height,
+                           fill=self.GCARD, outline="#3a3a3a")
+        c.create_text(INSET + 8, top + 12 * k, text=self.GRAPH_TITLES[metric],
+                      fill="#bbbbbb", font=self._font(9, "bold"), anchor="w")
+
+        vals = [v for v in list(w_vals) + list(b_vals) if v is not None]
+        n = max(len(w_vals), len(b_vals), 1)
 
         def gx(i):
-            return ML + (pw * i / (n - 1) if n > 1 else pw // 2)
+            return ML + (pw * i / (n - 1) if n > 1 else pw / 2)
 
-        # Gridlines + Y labels (only those within the current auto-scale range)
-        CANDS = [(v, ("0" if v == 0 else f"+{v}" if v > 0 else f"−{abs(v)}"))
-                 for v in range(-10, 11)]
-        for val, label in CANDS:
-            if not (y_min <= val <= y_max):
-                continue
-            y   = gy(val)
-            col = "#666" if val != 0 else "#888"
-            lw  = 2 if val == 0 else 1
-            c.create_line(ML, y, ML + pw, y, fill=col, width=lw,
-                          dash=() if val == 0 else (2, 3))
-            c.create_text(ML - 4, y, text=label, fill="#888",
-                          font=("Consolas", 7), anchor="e")
+        zero = None
+        if metric == "eval":
+            if vals:
+                y_max = min(10.0, max(1.0, max(vals)))
+                y_min = max(-10.0, min(-1.0, min(vals)))
+            else:
+                y_min, y_max = -1.0, 1.0
 
-        # Plot border
-        c.create_rectangle(ML, MT, ML + pw, MT + ph, outline="#444", width=1)
+            def gy(v):
+                v = max(y_min, min(y_max, float(v)))
+                return y0 + ph * (v - y_min) / (y_max - y_min)
 
-        # Lines
-        for evals, color in [(w_evals, self.C_W), (b_evals, self.C_B)]:
-            pts = [(i, v) for i, v in enumerate(evals) if v is not None]
+            step = next((s for s in (1, 2, 5) if ph * s / (y_max - y_min) >= MIN_GAP), 10)
+            ticks = [(v, "0" if v == 0 else f"+{v}" if v > 0 else f"−{abs(v)}")
+                     for v in range(-10, 11) if v % step == 0 and y_min <= v <= y_max]
+            zero = 0
+        elif metric == "depth":
+            vals = [v for v in vals if v >= 0]
+            top_v = max(vals) if vals else 10
+            step = next((s for s in (1, 2, 5, 10, 20, 50)
+                         if ph * s / max(top_v, 1) >= MIN_GAP), 100)
+            y_max = max(step, -(-top_v // step) * step)   # round up to a step
+
+            def gy(v):
+                return y0 + ph * (1 - max(0, min(y_max, v)) / y_max)
+
+            ticks = [(v, str(v)) for v in range(0, int(y_max) + 1, step)]
+        else:   # nodes
+            vals = [v for v in vals if v > 0]
+            if vals:
+                lo = math.floor(math.log10(min(vals)))
+                hi = math.ceil(math.log10(max(vals)))
+            else:
+                lo, hi = 3, 6
+            if hi <= lo:
+                hi = lo + 1
+
+            def gy(v):
+                if v <= 0:
+                    return y0 + ph
+                return y0 + ph * (1 - (math.log10(v) - lo) / (hi - lo))
+
+            every = next((k for k in range(1, 10) if ph * k / (hi - lo) >= MIN_GAP), 10)
+            ticks = [(10 ** e, fmt_count(10 ** e)) for e in range(lo, hi + 1)
+                     if (e - lo) % every == 0]
+
+        for val, label in ticks:
+            y = gy(val)
+            is_zero = val == zero
+            c.create_line(ML, y, ML + pw, y, fill="#888" if is_zero else "#666",
+                          width=2 if is_zero else 1, dash=() if is_zero else (2, 3))
+            c.create_text(ML - 4, y, text=label, fill="#999",
+                          font=self._font(8), anchor="e")
+
+        c.create_rectangle(ML, y0, ML + pw, y0 + ph, outline="#4a4a4a", width=1)
+
+        if not vals and n >= 2:
+            # Moves have been played, but the engines never reported this value
+            c.create_text(ML + pw / 2, y0 + ph / 2, text="no data from engines",
+                          fill="#666", font=self._font(9))
+
+        for series, color in ((w_vals, self.C_W), (b_vals, self.C_B)):
+            pts = [(i, v) for i, v in enumerate(series)
+                   if v is not None and (metric != "nodes" or v > 0)]
             if len(pts) >= 2:
                 coords = []
                 for i, v in pts:
                     coords.extend([gx(i), gy(v)])
                 c.create_line(*coords, fill=color, width=2, smooth=False)
-
-        # Legend — Black on top, White below (mirrors board orientation)
-        for y_off, color, label in [
-            (MT + ph + 16, self.C_B, f"B: {self.black_name[:12]}"),
-            (MT + ph + 36, self.C_W, f"W: {self.white_name[:12]}"),
-        ]:
-            c.create_line(ML, y_off, ML + 16, y_off, fill=color, width=2)
-            c.create_text(ML + 20, y_off, text=label, fill=color,
-                          font=("Consolas", 9), anchor="w")
+            elif len(pts) == 1:
+                x, y = gx(pts[0][0]), gy(pts[0][1])
+                c.create_oval(x - 2, y - 2, x + 2, y + 2, fill=color, outline="")
 
     # ── Engine picker ──
 
@@ -1149,6 +1931,8 @@ class ChessGUI:
             self._log_btn_b.config(text=f"☰  {name[:14]}")
 
     def _on_name_click(self, color: chess.Color):
+        if self._tournament_running:
+            return
         if not (self._game_over or not self._game_started):
             return
         self._open_engine_picker(color)
@@ -1157,26 +1941,8 @@ class ChessGUI:
         tk   = self._tk
         side = "White" if color == chess.WHITE else "Black"
 
-        # Build list: engines/ folder first, then history extras
-        engines_dir = os.path.join(APP_DIR, "engines")
-        items: list[tuple[str, str, str]] = []  # (display_name, abs_path, source)
-        seen: set[str] = set()
-
-        if os.path.isdir(engines_dir):
-            for fname in sorted(os.listdir(engines_dir)):
-                fpath = os.path.join(engines_dir, fname)
-                if os.path.isfile(fpath) and not fname.startswith("."):
-                    apath = os.path.abspath(fpath)
-                    name  = os.path.splitext(fname)[0]
-                    items.append((name, apath, "default"))
-                    seen.add(apath)
-
-        for hpath in _load_engine_history():
-            apath = os.path.abspath(hpath)
-            if apath not in seen and os.path.isfile(apath):
-                name = os.path.splitext(os.path.basename(apath))[0]
-                items.append((f"{name}  ↩", apath, "recent"))
-                seen.add(apath)
+        # engines/ folder first, then history extras
+        items = _engine_candidates()   # (display_name, abs_path, source)
 
         # Dialog
         BG  = "#1a1a1a"
@@ -1184,12 +1950,12 @@ class ChessGUI:
         win = tk.Toplevel(self.root)
         win.title(f"Select Engine — {side}")
         win.configure(bg=BG)
-        win.geometry("380x300")
-        win.resizable(False, True)
+        win.geometry(f"{round(380 * self._scale)}x{round(300 * self._scale)}")
+        win.resizable(True, True)
         win.transient(self.root)
         win.grab_set()
 
-        tk.Label(win, text=f"Engine for {side}:", font=("Consolas", 10, "bold"),
+        tk.Label(win, text=f"Engine for {side}:", font=self._font(10, "bold"),
                  fg="#aaaaaa", bg=BG, padx=12).pack(anchor="w", pady=(8, 4))
 
         lf = tk.Frame(win, bg=BG, padx=12)
@@ -1197,7 +1963,7 @@ class ChessGUI:
         vsb = tk.Scrollbar(lf)
         vsb.pack(side="right", fill="y")
         lb = tk.Listbox(
-            lf, font=("Consolas", 10), bg="#111111", fg=FG,
+            lf, font=self._font(10), bg="#111111", fg=FG,
             selectbackground="#3a5a00", selectforeground="white",
             relief="flat", activestyle="none", yscrollcommand=vsb.set,
         )
@@ -1239,7 +2005,7 @@ class ChessGUI:
         def _mk(parent, text, fg, cmd, **kw):
             bg  = kw.pop("bg",              "#3a3a3a")
             abg = kw.pop("activebackground", "#555555")
-            return tk.Button(parent, text=text, font=("Consolas", 9),
+            return tk.Button(parent, text=text, font=self._font(9),
                              bg=bg, fg=fg, relief="flat", padx=10, pady=3,
                              activebackground=abg, activeforeground="white",
                              cursor="hand2", command=cmd, **kw)
@@ -1269,14 +2035,15 @@ class ChessGUI:
         win.title(f"Engine Log — {engine.name}")
         win.configure(bg="#111111")
         has_options = bool(engine.options)
-        win.geometry("960x480" if has_options else "740x480")
+        k = self._scale
+        win.geometry(f"{round((960 if has_options else 740) * k)}x{round(480 * k)}")
 
         # Toolbar
         tb = tk.Frame(win, bg="#1a1a1a", pady=4, padx=8)
         tb.pack(fill="x")
-        tk.Label(tb, text=engine.name, font=("Consolas", 11, "bold"),
+        tk.Label(tb, text=engine.name, font=self._font(11, "bold"),
                  fg="#dddddd", bg="#1a1a1a").pack(side="left")
-        tk.Button(tb, text="Clear", font=("Consolas", 9),
+        tk.Button(tb, text="Clear", font=self._font(9),
                   bg="#3a3a3a", fg="#aaaaaa", relief="flat", padx=8,
                   activebackground="#555", activeforeground="white",
                   cursor="hand2",
@@ -1293,7 +2060,7 @@ class ChessGUI:
         sb.pack(side="right", fill="y")
         txt = tk.Text(
             log_frame, bg="#111111", fg="#cccccc",
-            font=("Consolas", 9), wrap="word",
+            font=self._font(9), wrap="word",
             yscrollcommand=sb.set,
             state="disabled", relief="flat",
         )
@@ -1341,11 +2108,11 @@ class ChessGUI:
 
             tk.Frame(content, bg="#333333", width=1).pack(side="left", fill="y")
 
-            panel = tk.Frame(content, bg=OBG, width=212)
+            panel = tk.Frame(content, bg=OBG, width=round(212 * k))
             panel.pack(side="left", fill="y")
             panel.pack_propagate(False)
 
-            tk.Label(panel, text="Engine Options", font=("Consolas", 10, "bold"),
+            tk.Label(panel, text="Engine Options", font=self._font(10, "bold"),
                      fg="#aaaaaa", bg=OBG, anchor="w", padx=10, pady=6).pack(fill="x")
             tk.Frame(panel, bg="#2a2a2a", height=1).pack(fill="x")
 
@@ -1376,7 +2143,7 @@ class ChessGUI:
 
                 if opt_type == "button":
                     btn = tk.Button(
-                        row, text=opt_name, font=("Consolas", 9),
+                        row, text=opt_name, font=self._font(9),
                         bg="#3a3a3a", fg=OFG, relief="flat", padx=6,
                         activebackground="#555", activeforeground="white",
                         cursor="hand2",
@@ -1395,7 +2162,7 @@ class ChessGUI:
 
                     cb = tk.Checkbutton(
                         row, text=opt_name, variable=var,
-                        font=("Consolas", 9), fg=OFG, bg=OBG,
+                        font=self._font(9), fg=OFG, bg=OBG,
                         selectcolor="#333333", activebackground=OBG,
                         activeforeground=OFG, relief="flat",
                         cursor="hand2", command=_on_check,
@@ -1404,7 +2171,7 @@ class ChessGUI:
                     _bind_mousewheel(cb)
 
                 elif opt_type == "spin":
-                    tk.Label(row, text=opt_name, font=("Consolas", 9),
+                    tk.Label(row, text=opt_name, font=self._font(9),
                              fg=OFG, bg=OBG, anchor="w").pack(fill="x")
                     spin_var = tk.StringVar(value=opt["value"] or "")
                     from_val = int(opt["min"]) if opt["min"] is not None else 0
@@ -1412,7 +2179,7 @@ class ChessGUI:
                     spin = tk.Spinbox(
                         row, textvariable=spin_var,
                         from_=from_val, to=to_val,
-                        font=("Consolas", 9), width=8,
+                        font=self._font(9), width=8,
                         bg="#2a2a2a", fg=OFG, relief="flat",
                         buttonbackground="#3a3a3a",
                         insertbackground=OFG,
@@ -1428,7 +2195,7 @@ class ChessGUI:
                     spin.bind("<Return>",   _on_spin)
 
                 elif opt_type == "combo":
-                    tk.Label(row, text=opt_name, font=("Consolas", 9),
+                    tk.Label(row, text=opt_name, font=self._font(9),
                              fg=OFG, bg=OBG, anchor="w").pack(fill="x")
                     combo_var = tk.StringVar(value=opt["value"] or "")
                     choices = opt["var"] or [opt["value"]]
@@ -1438,21 +2205,21 @@ class ChessGUI:
                         engine.set_option(n, val)
 
                     om = tk.OptionMenu(row, combo_var, *choices, command=_on_combo)
-                    om.config(font=("Consolas", 9), bg="#2a2a2a", fg=OFG,
+                    om.config(font=self._font(9), bg="#2a2a2a", fg=OFG,
                               activebackground="#3a3a3a", activeforeground=OFG,
                               relief="flat", padx=4, cursor="hand2")
                     om["menu"].config(bg="#2a2a2a", fg=OFG, activebackground="#444",
-                                      activeforeground=OFG, font=("Consolas", 9))
+                                      activeforeground=OFG, font=self._font(9))
                     om.pack(anchor="w")
                     _bind_mousewheel(om)
 
                 else:  # string
-                    tk.Label(row, text=opt_name, font=("Consolas", 9),
+                    tk.Label(row, text=opt_name, font=self._font(9),
                              fg=OFG, bg=OBG, anchor="w").pack(fill="x")
                     str_var = tk.StringVar(value=opt["value"] or "")
                     entry = tk.Entry(
                         row, textvariable=str_var,
-                        font=("Consolas", 9), width=20,
+                        font=self._font(9), width=20,
                         bg="#2a2a2a", fg=OFG, relief="flat",
                         insertbackground=OFG,
                     )
@@ -1482,10 +2249,610 @@ class ChessGUI:
 
         _poll()
 
+    # ── Tournament panel (right of the graph) ──
+
+    TW   = 380         # tournament panel width (px)
+    T_BG = "#161616"
+
+    def _build_tournament_panel(self, parent):
+        tk, BG = self._tk, self.T_BG
+        p = tk.Frame(parent, bg=BG, width=self.TW)
+        p.pack_propagate(False)   # size is set by _layout()
+        self._tpanel = p
+        self._tpanel_shown = False
+
+        hdr = tk.Frame(p, bg=BG)
+        hdr.pack(fill="x", padx=10, pady=(8, 2))
+        self._t_title = tk.Label(hdr, text="Tournament", font=self._font(11, "bold"),
+                                 fg="white", bg=BG, anchor="w")
+        self._t_title.pack(side="left")
+        self._t_close = tk.Label(hdr, text="✕", font=self._font(10, family="Segoe UI Symbol"),
+                                 fg="#444444", bg=BG)
+        self._t_close.pack(side="right")
+        self._t_close.bind("<Button-1>", lambda e: self._close_tournament_panel())
+
+        self._t_info = tk.Label(p, text="", font=self._font(9), fg="#aaaaaa",
+                                bg=BG, anchor="w", justify="left")
+        self._t_info.pack(fill="x", padx=10)
+
+        TXT = dict(font=self._font(9), bg="#111111", fg="#cccccc", relief="flat",
+                   wrap="none", padx=6, pady=4, cursor="arrow", highlightthickness=0,
+                   state="disabled")
+        # The table's box is sized in pixels after each render: lines with a
+        # pawn glyph are taller than a Text widget's line-based height allows
+        self._t_table_box = tk.Frame(p, bg="#111111", height=60)
+        self._t_table_box.pack_propagate(False)
+        self._t_table_box.pack(fill="x", padx=10, pady=(6, 0))
+        self._t_table = tk.Text(self._t_table_box, height=3, **TXT)
+        self._t_table.pack(fill="both", expand=True)
+
+        tk.Label(p, text="Recent results", font=self._font(9, "bold"), fg="#777777",
+                 bg=BG, anchor="w").pack(fill="x", padx=10, pady=(10, 2))
+        rf = tk.Frame(p, bg=BG)
+        rf.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        sb = tk.Scrollbar(rf)
+        self._t_results = tk.Text(rf, **TXT)
+        self._t_results.pack(side="left", fill="both", expand=True)
+        sb.config(command=self._t_results.yview)
+
+        # Show the scrollbar only when the results don't fit
+        sb_shown = [False]
+
+        def _yscroll(first, last):
+            sb.set(first, last)
+            need = float(first) > 0.0 or float(last) < 1.0
+            if need != sb_shown[0]:
+                sb_shown[0] = need
+                if need:
+                    sb.pack(side="right", fill="y", before=self._t_results)
+                else:
+                    sb.pack_forget()
+
+        self._t_results.config(yscrollcommand=_yscroll)
+
+        for t in (self._t_table, self._t_results):
+            t.tag_config("hdr",     foreground="#777777")
+            t.tag_config("playing", foreground="#88ff44")
+            t.tag_config("leader",  foreground="#ffcc44")
+            t.tag_config("dim",     foreground="#666666")
+            t.tag_config("win",     foreground="#ffffff")
+            t.tag_config("draw",    foreground="#aaaaaa")
+            t.tag_config("side_w",  foreground="#ffffff",
+                         font=self._font(12, family="Segoe UI Symbol"))
+            t.tag_config("side_b",  foreground="#ffffff",
+                         font=self._font(12, family="Segoe UI Symbol"))
+
+    def _show_tournament_panel(self):
+        if not self._tpanel_shown:
+            self._tpanel_shown = True
+            self._update_min_size()
+            self._layout()
+
+    def _close_tournament_panel(self):
+        if self._tournament_running or not self._tpanel_shown:
+            return
+        self._tpanel_shown = False
+        self._last_tournament_snap = None
+        self._update_min_size()
+        self._layout()
+
+    def _pawn_marker(self, white: bool):
+        """Small pawn image for the standings, sized to the text: solid white
+        for White, black with a white outline for Black (so both read clearly
+        on the dark background). None without PIL / pieces.png."""
+        if not self._piece_src:
+            return None
+        h = max(8, self._font(9).metrics("linespace") - 1)
+        key = (white, h)
+        cache = self.__dict__.setdefault("_pawn_marks", {})
+        if key in cache:
+            return cache[key]
+        from PIL import Image, ImageFilter, ImageTk
+        shape = self._piece_src[(chess.PAWN, True)].getchannel("A")
+        inner = h - 2   # leave 1 px on each side for the outline
+        w = max(4, round(shape.width * inner / shape.height))
+        mask = shape.resize((w, inner), Image.LANCZOS)
+        canvas_mask = Image.new("L", (w + 2, h), 0)
+        canvas_mask.paste(mask, (1, 1))
+        if white:
+            img = Image.new("RGBA", canvas_mask.size, (255, 255, 255, 255))
+            img.putalpha(canvas_mask)
+        else:
+            outline = canvas_mask.filter(ImageFilter.MaxFilter(3))
+            img = Image.new("RGBA", canvas_mask.size, (255, 255, 255, 255))
+            img.putalpha(outline)
+            body = Image.new("RGBA", canvas_mask.size, (0, 0, 0, 255))
+            body.putalpha(canvas_mask)
+            img = Image.alpha_composite(img, body)
+        cache[key] = ImageTk.PhotoImage(img)
+        return cache[key]
+
+    # ── Tooltips for engine names shortened to fit a column ──
+
+    def _insert_name(self, t, name: str, width: int, tags=()):
+        """Insert `name` padded to `width` chars. A longer name is cut off with
+        '…' and shows the full name in a tooltip on hover."""
+        tags = tuple(tags) if isinstance(tags, (tuple, list)) else ((tags,) if tags else ())
+        if len(name) <= width:
+            t.insert("end", f"{name:<{width}}", tags)
+            return
+        self._tip_seq = getattr(self, "_tip_seq", 0) + 1
+        tip = f"nametip{self._tip_seq}"
+        t.tag_bind(tip, "<Enter>", lambda e, n=name: self._show_tip(e, n))
+        t.tag_bind(tip, "<Motion>", lambda e: self._move_tip(e))
+        t.tag_bind(tip, "<Leave>", lambda e: self._hide_tip())
+        t.insert("end", name[:width - 1] + "…", tags + (tip,))
+
+    def _clear_name_tips(self, t):
+        self._hide_tip()
+        for tag in t.tag_names():
+            if tag.startswith("nametip"):
+                t.tag_delete(tag)
+
+    def _show_tip(self, event, text: str):
+        self._hide_tip()
+        tk = self._tk
+        tip = tk.Toplevel(self.root)
+        tip.overrideredirect(True)
+        tip.attributes("-topmost", True)
+        tk.Label(tip, text=text, font=self._font(9), fg="#eeeeee", bg="#333333",
+                 padx=6, pady=2, relief="solid", bd=1).pack()
+        self._tip = tip
+        self._move_tip(event)
+
+    def _move_tip(self, event):
+        tip = getattr(self, "_tip", None)
+        if tip is not None:
+            tip.geometry(f"+{event.x_root + 12}+{event.y_root + 16}")
+
+    def _hide_tip(self):
+        tip = getattr(self, "_tip", None)
+        if tip is not None:
+            self._tip = None
+            try:
+                tip.destroy()
+            except Exception:
+                pass
+
+    def _fit_table_height(self, lines: int):
+        t = self._t_table
+        pad = 2 * int(t.cget("pady")) + 4
+        px = None
+        try:
+            t.update_idletasks()
+            n = t.count("1.0", "end", "ypixels")
+            px = n[0] if isinstance(n, tuple) else n
+        except Exception:
+            pass
+        if not px:
+            px = lines * self._font(9).metrics("linespace") * 1.4
+        cap = 15 * self._font(9).metrics("linespace") * 1.4   # scroll beyond ~14 rows
+        self._t_table_box.config(height=int(min(px, cap)) + pad)
+
+    def _render_tournament(self, snap: dict):
+        """Draw a Tournament.snapshot() in the panel."""
+        self._show_tournament_panel()
+        self._last_tournament_snap = snap
+        status, rows = snap["status"], snap["rows"]
+        self._t_title.config(text=snap["title"])
+
+        lines = [f"{snap['progress']}   ·   {snap['tc']}"]
+        color = "#aaaaaa"
+        if status == "starting":
+            lines.append("Starting engines…")
+        elif status == "running" and snap["current"]:
+            lines.append(f"Now: ♙ {snap['current'][0]} – ♟ {snap['current'][1]}")
+        elif status == "finished":
+            winners = [r["name"] for r in rows if r["rank"] == 1]
+            lines.append(("Winner: " if len(winners) == 1 else "Shared 1st: ")
+                         + ", ".join(winners))
+            color = "#ffcc44"
+        elif status == "stopped":
+            lines.append("Stopped")
+            color = "#ff7755"
+        self._t_info.config(text="\n".join(lines), fg=color)
+
+        # Standings
+        # Engines in the current game are green, with a pawn of their color
+        # in the second column: ♙ = White, ♟ = Black
+        playing = {}
+        if snap["current"]:
+            playing = {snap["current"][0]: "W", snap["current"][1]: "B"}
+        t = self._t_table
+        t.config(state="normal")
+        t.delete("1.0", "end")
+        self._clear_name_tips(t)
+        # The pawn marker is an image (or a glyph without PIL), not a Consolas
+        # character, so a tab stop after it keeps the columns aligned
+        f_txt = self._font(9)
+        marks = {s: self._pawn_marker(s == "W") for s in ("W", "B")}
+        if marks["W"]:
+            mark_w = marks["W"].width()
+        else:
+            mark_w = self._font(12, family="Segoe UI Symbol").measure("♟")
+        tab = f_txt.measure("99 ") + mark_w + f_txt.measure(" ")
+        t.config(tabs=(tab,))
+        t.insert("end", f"{'#':>2}\t{'Engine':<17} {'G':>2} {'W':>2} {'D':>2} "
+                        f"{'L':>2} {'Pts':>5} {'SB':>6}", "hdr")
+        for r in rows:
+            side = playing.get(r["name"])
+            if side:
+                tag = "playing"
+            elif status == "finished" and r["rank"] == 1:
+                tag = "leader"
+            else:
+                tag = ()
+            t.insert("end", f"\n{r['rank']:>2} ", tag)
+            if side and marks[side]:
+                t.image_create("end", image=marks[side], align="center")
+            elif side:
+                t.insert("end", "♙" if side == "W" else "♟",
+                         "side_w" if side == "W" else "side_b")
+            t.insert("end", "\t", tag)
+            self._insert_name(t, r["name"], 17, tag)
+            t.insert("end", f" {r['games']:>2} {r['wins']:>2} "
+                            f"{r['draws']:>2} {r['losses']:>2} {r['points']:>5g} "
+                            f"{r['sb']:>6.2f}", tag)
+        t.config(state="disabled")
+        self._fit_table_height(len(rows) + 1)
+
+        # Results, newest first
+        t = self._t_results
+        t.config(state="normal")
+        t.delete("1.0", "end")
+        self._clear_name_tips(t)
+        if not snap["results"]:
+            t.insert("end", "No games finished yet", "dim")
+        for k, e in enumerate(snap["results"]):
+            if k:
+                t.insert("end", "\n")
+            t.insert("end", f"R{e['round']:<3}", "dim")
+            if e["type"] == "bye":
+                self._insert_name(t, e["name"], 14)
+                t.insert("end", " ")
+                t.insert("end", "bye (+1)", "dim")
+                continue
+            res = e["result"].replace("1/2", "½")
+            self._insert_name(t, e["white"], 14)
+            t.insert("end", " ")
+            t.insert("end", f"{res:^5}", "draw" if "½" in res else "win")
+            t.insert("end", " ")
+            self._insert_name(t, e["black"], 14)
+            t.insert("end", " ")
+            t.insert("end", e["reason"], "dim")
+        t.config(state="disabled")
+        t.yview_moveto(0.0)
+
+    # ── Tournament mode ──
+
+    def enter_tournament_mode(self, paused: bool = False):
+        """Switch buttons to tournament behaviour and start running (or wait
+        for ▶ if `paused`). Main thread."""
+        self._tournament_running = True
+        self._think_start  = None
+        self._game_started = True
+        self._game_over    = False
+        if paused:
+            self._resume_event.clear()
+            self._play_btn.config(state="normal", text="▶", fg="#88ff44", cursor="hand2")
+        else:
+            self._resume_event.set()
+            self._play_btn.config(state="normal", text="⏸", fg="#ffaa44", cursor="hand2")
+        self._action_btn.config(state="normal", cursor="hand2")
+        self._tourn_btn.config(state="disabled", cursor="")
+        self._t_close.config(fg="#444444", cursor="")
+        self._bn.config(cursor="")
+        self._wn.config(cursor="")
+        self._update_action_btn()
+        self._show_tournament_panel()
+        self._t_title.config(text="Tournament")
+        self._t_info.config(text="Starting engines…", fg="#aaaaaa")
+        for t in (self._t_table, self._t_results):
+            t.config(state="normal")
+            t.delete("1.0", "end")
+            t.config(state="disabled")
+
+    def prepare_tournament_game(self, white_engine, black_engine):
+        """Clear the board for the next tournament game. Main thread."""
+        self.set_engines(white_engine, black_engine)
+        self._update_engine_name(chess.WHITE, white_engine.name)
+        self._update_engine_name(chess.BLACK, black_engine.name)
+        self._think_start  = None
+        self._game_over    = False
+        self._game_started = True
+        self._draw_board(chess.Board())
+        self._draw_graph({})
+        self._last_move_lbl.config(text="")
+        self._moves_lbl.config(text="")
+        for frame, nm, tm, ev in [
+            (self._wf, self._wn, self._wt, self._we),
+            (self._bf, self._bn, self._bt, self._be),
+        ]:
+            for w in (frame, nm, tm, ev):
+                w.config(bg=self.BG_IDLE)
+            ev.config(text="eval: ---")
+        self._update_action_btn()
+
+    def exit_tournament_mode(self):
+        """Back to normal buttons. The panel stays until closed with ✕. Main thread."""
+        self._tournament_running = False
+        self._think_start = None
+        self._tourn_btn.config(state="normal", cursor="hand2")
+        self._t_close.config(fg="#aaaaaa", cursor="hand2")
+        self._update_action_btn()
+
+    # ── Tournament setup dialog ──
+
+    def _open_tournament_dialog(self):
+        if self._tournament_running or not self._tournament_start_cb:
+            return
+        tk = self._tk
+        BG, FG, DIM = "#1a1a1a", "#cccccc", "#888888"
+        ENTRY = dict(font=self._font(10), width=9, bg="#2e2e2e", fg="white",
+                     insertbackground="white", relief="flat",
+                     highlightthickness=1, highlightbackground="#444444",
+                     highlightcolor="#55aaff", justify="right")
+        saved = _load_tournament_settings()
+        tc = self._settings_get_cb() if self._settings_get_cb else _default_time_control()
+
+        items = [(disp, path) for disp, path, _ in _engine_candidates()]
+        known = {p for _, p in items}
+        for pth in saved.get("engines", []):
+            apath = os.path.abspath(pth)
+            if apath not in known and os.path.isfile(apath):
+                items.append((os.path.splitext(os.path.basename(apath))[0], apath))
+                known.add(apath)
+
+        win = tk.Toplevel(self.root)
+        win.title("Tournament")
+        win.configure(bg=BG, padx=18, pady=14)
+        win.resizable(False, False)
+        win.transient(self.root)
+
+        tk.Label(win, text="Tournament", font=self._font(12, "bold"), fg="white",
+                 bg=BG).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
+        tk.Label(win, text="Engines (click to select, 2 or more):", font=self._font(9),
+                 fg=DIM, bg=BG).grid(row=1, column=0, columnspan=4, sticky="w")
+
+        lf = tk.Frame(win, bg=BG)
+        lf.grid(row=2, column=0, columnspan=4, sticky="we", pady=(2, 4))
+        vsb = tk.Scrollbar(lf)
+        vsb.pack(side="right", fill="y")
+        lb = tk.Listbox(lf, font=self._font(10), bg="#111111", fg=FG, height=8, width=44,
+                        selectmode="multiple", exportselection=False,
+                        selectbackground="#3a5a00", selectforeground="white",
+                        relief="flat", activestyle="none", yscrollcommand=vsb.set)
+        lb.pack(side="left", fill="both", expand=True)
+        vsb.config(command=lb.yview)
+        selected = {os.path.abspath(p) for p in saved.get("engines", [])}
+        for k, (disp, path) in enumerate(items):
+            lb.insert("end", f"  {disp}")
+            if path in selected:
+                lb.selection_set(k)
+
+        def _browse():
+            from tkinter import filedialog
+            path = filedialog.askopenfilename(
+                title="Add engine to tournament",
+                filetypes=[("Executable", "*.exe"), ("All files", "*.*")], parent=win)
+            if not path:
+                return
+            apath = os.path.abspath(path)
+            if apath in known:
+                k = [p for _, p in items].index(apath)
+            else:
+                items.append((os.path.splitext(os.path.basename(apath))[0], apath))
+                known.add(apath)
+                lb.insert("end", f"  {items[-1][0]}")
+                k = len(items) - 1
+            lb.selection_set(k)
+            lb.see(k)
+            _update()
+
+        tk.Button(win, text="Add engine…", font=self._font(9), bg="#3a3a3a", fg="#aaaaaa",
+                  relief="flat", padx=10, pady=2, activebackground="#555555",
+                  activeforeground="white", cursor="hand2", command=_browse
+                  ).grid(row=3, column=0, columnspan=4, sticky="w")
+
+        # Format + count
+        fmt_var = tk.StringVar(value=saved.get("format", "rr")
+                               if saved.get("format") in ("rr", "swiss") else "rr")
+        counts = {"rr": int(saved.get("rr_rounds", 1) or 1),
+                  "swiss": int(saved.get("swiss_matches", 5) or 5)}
+        count_var = tk.StringVar(value=str(counts[fmt_var.get()]))
+        cur_fmt = [fmt_var.get()]
+
+        ff = tk.Frame(win, bg=BG)
+        ff.grid(row=4, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        tk.Label(ff, text="Format:", font=self._font(10), fg=FG, bg=BG, width=20,
+                 anchor="w").pack(side="left")
+        RB = dict(variable=fmt_var, font=self._font(10), fg=FG, bg=BG,
+                  selectcolor="#2e2e2e", activebackground=BG, activeforeground="white",
+                  cursor="hand2")
+
+        cf = tk.Frame(win, bg=BG)
+        cf.grid(row=5, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        count_lbl = tk.Label(cf, text="", font=self._font(10), fg=FG, bg=BG,
+                             width=20, anchor="w")
+        count_lbl.pack(side="left")
+        tk.Spinbox(cf, from_=1, to=99, textvariable=count_var, width=5,
+                   font=self._font(10), bg="#2e2e2e", fg="white", relief="flat",
+                   buttonbackground="#3a3a3a", insertbackground="white",
+                   justify="right").pack(side="left")
+        games_lbl = tk.Label(cf, text="", font=self._font(9), fg=DIM, bg=BG)
+        games_lbl.pack(side="left", padx=(10, 0))
+
+        def _on_fmt():
+            try:
+                counts[cur_fmt[0]] = max(1, int(count_var.get()))
+            except ValueError:
+                pass
+            cur_fmt[0] = fmt_var.get()
+            count_var.set(str(counts[cur_fmt[0]]))
+            _update()
+
+        tk.Radiobutton(ff, text="Round robin", value="rr", command=_on_fmt, **RB
+                       ).pack(side="left")
+        tk.Radiobutton(ff, text="Swiss", value="swiss", command=_on_fmt, **RB
+                       ).pack(side="left", padx=(10, 0))
+
+        # Time control (same for all engines)
+        tf = tk.Frame(win, bg=BG)
+        tf.grid(row=6, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        tk.Label(tf, text="Time / increment:", font=self._font(10), fg=FG, bg=BG,
+                 width=20, anchor="w").pack(side="left")
+        time_e = tk.Entry(tf, **ENTRY)
+        time_e.insert(0, fmt_duration(saved.get("time", tc["white_time"])))
+        time_e.pack(side="left")
+        tk.Label(tf, text="+", font=self._font(10), fg=DIM, bg=BG).pack(side="left", padx=4)
+        inc_e = tk.Entry(tf, **ENTRY)
+        inc_e.insert(0, f"{float(saved.get('inc', tc['white_inc'])):g}")
+        inc_e.pack(side="left")
+        tk.Label(win, text="Time: seconds or m:ss   Increment: seconds",
+                 font=self._font(8), fg="#666666", bg=BG
+                 ).grid(row=7, column=0, columnspan=4, sticky="w", pady=(4, 0))
+
+        msg = tk.Label(win, text="", font=self._font(9), fg="#ff5533", bg=BG)
+        msg.grid(row=8, column=0, columnspan=4, sticky="w", pady=(6, 0))
+
+        def _update(*_):
+            fmt = fmt_var.get()
+            count_lbl.config(text="Rounds:" if fmt == "rr" else "Matches per engine:")
+            n = len(lb.curselection())
+            try:
+                c = max(1, int(count_var.get()))
+            except ValueError:
+                games_lbl.config(text="")
+                return
+            if n < 2:
+                games_lbl.config(text="select at least 2 engines")
+                return
+            total = c * n * (n - 1) // 2 if fmt == "rr" else c * (n // 2)
+            note = " (with rematches)" if fmt == "swiss" and c > n - 1 + n % 2 else ""
+            games_lbl.config(text=f"= {total} game{'s' if total != 1 else ''}{note}")
+
+        lb.bind("<<ListboxSelect>>", _update)
+        count_var.trace_add("write", _update)
+        _update()
+
+        def _start(event=None):
+            sel = [items[k][1] for k in lb.curselection()]
+            if len(sel) < 2:
+                msg.config(text="Select at least 2 engines.")
+                return
+            try:
+                count = int(count_var.get())
+                if not 1 <= count <= 999:
+                    raise ValueError
+            except ValueError:
+                msg.config(text=f"Invalid number: {count_var.get()!r}")
+                return
+            try:
+                t = parse_duration(time_e.get())
+                if t <= 0:
+                    raise ValueError
+            except ValueError:
+                msg.config(text=f"Invalid time: {time_e.get()!r}")
+                return
+            try:
+                inc = float(inc_e.get().strip() or 0)
+                if inc < 0:
+                    raise ValueError
+            except ValueError:
+                msg.config(text=f"Invalid increment: {inc_e.get()!r}")
+                return
+            fmt = fmt_var.get()
+            counts[fmt] = count
+            _save_tournament_settings({
+                "engines": sel, "format": fmt,
+                "rr_rounds": counts["rr"], "swiss_matches": counts["swiss"],
+                "time": t, "inc": inc,
+            })
+            # Unique display names (two engines may share a file name)
+            names, used = [], {}
+            for pth in sel:
+                base = os.path.splitext(os.path.basename(pth))[0]
+                used[base] = used.get(base, 0) + 1
+                names.append(base if used[base] == 1 else f"{base} #{used[base]}")
+            cfg = {"engines": list(zip(names, sel)), "format": fmt,
+                   "count": count, "time": t, "inc": inc}
+            win.destroy()
+            self._tournament_start_cb(cfg)
+
+        def _continue():
+            from tkinter import filedialog
+            os.makedirs(TOURNAMENTS_DIR, exist_ok=True)
+            path = filedialog.askopenfilename(
+                title="Continue tournament", initialdir=TOURNAMENTS_DIR,
+                filetypes=[("Tournament", "*.json"), ("All files", "*.*")], parent=win)
+            if not path:
+                return
+            try:
+                st = _load_tournament_file(path)
+            except ValueError as e:
+                msg.config(text=str(e))
+                return
+            win.destroy()
+            self._tournament_start_cb({"resume": st})
+
+        tk.Button(win, text="Continue from file…", font=self._font(9), bg="#3a3a3a",
+                  fg="#ffcc44", relief="flat", padx=10, pady=4, activebackground="#555555",
+                  activeforeground="#ffdd66", cursor="hand2", command=_continue
+                  ).grid(row=9, column=0, columnspan=2, sticky="w", pady=(12, 0))
+
+        bf = tk.Frame(win, bg=BG)
+        bf.grid(row=9, column=2, columnspan=2, sticky="e", pady=(12, 0))
+        tk.Button(bf, text="Start", font=self._font(9),
+                  bg="#2a4a00", fg="#88ff44", relief="flat", padx=14, pady=4,
+                  activebackground="#3a6a00", activeforeground="#aaff66",
+                  cursor="hand2", command=_start).pack(side="left", padx=(0, 8))
+        tk.Button(bf, text="Cancel", font=self._font(9),
+                  bg="#3a3a3a", fg="#aaaaaa", relief="flat", padx=12, pady=4,
+                  activebackground="#555555", activeforeground="white",
+                  cursor="hand2", command=win.destroy).pack(side="left")
+        if self.game_in_progress:
+            tk.Label(win, text="Starting a tournament stops the current game.",
+                     font=self._font(9), fg="#ffaa44", bg=BG
+                     ).grid(row=10, column=0, columnspan=4, sticky="w", pady=(8, 0))
+
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.bind("<Return>", _start)
+
+        win.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width()  - win.winfo_reqwidth())  // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - win.winfo_reqheight()) // 3
+        win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        win.grab_set()
+        win.wait_window()
+
+    def save_tournament_file(self, st: dict, ask: Optional[str] = None) -> Optional[str]:
+        """Let the user save a tournament state to a file. With `ask`, first
+        ask whether to save at all. Returns the path, or None. Main thread."""
+        from tkinter import filedialog, messagebox
+        if ask and not messagebox.askyesno("Save tournament", ask, parent=self.root):
+            return None
+        try:
+            os.makedirs(TOURNAMENTS_DIR, exist_ok=True)
+        except OSError:
+            pass
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M")
+        path = filedialog.asksaveasfilename(
+            title="Save tournament", parent=self.root, initialdir=TOURNAMENTS_DIR,
+            initialfile=f"tournament_{stamp}.json", defaultextension=".json",
+            filetypes=[("Tournament", "*.json"), ("All files", "*.*")])
+        if not path:
+            return None
+        try:
+            _write_json_atomic(path, st)
+        except OSError as e:
+            messagebox.showerror("Save tournament", f"Could not save:\n{e}", parent=self.root)
+            return None
+        return path
+
     # ── Play / Pause ──
 
     def _on_play_pause(self):
-        if self._game_over:
+        if self._game_over and not self._tournament_running:
             self._on_restart()
             return
         if self._resume_event.is_set():
@@ -1501,6 +2868,12 @@ class ChessGUI:
                 self._update_action_btn()
 
     def _set_game_over_btn(self):
+        if self._tournament_running:
+            # The tournament moves on to the next game by itself; ▶/⏸ keeps
+            # pausing and resuming the tournament.
+            self._game_over   = True
+            self._think_start = None
+            return
         self._game_over = True
         self._resume_event.clear()
         self._play_btn.config(text="↺", fg="#44aaff")
@@ -1528,7 +2901,7 @@ class ChessGUI:
         self._bn.config(cursor="hand2")
         self._wn.config(cursor="hand2")
         self._draw_board(chess.Board())
-        self._draw_graph([], [])
+        self._draw_graph({})
         self._status.config(text="Restarting...")
         self._last_move_lbl.config(text="")
         self._moves_lbl.config(text="")
@@ -1585,8 +2958,10 @@ class ChessGUI:
             self._last_move_lbl.config(text=d["move"])
         if "moves_text" in d:
             self._moves_lbl.config(text=d["moves_text"])
-        if "eval_history" in d:
-            self._draw_graph(*d["eval_history"])
+        if "graph_history" in d:
+            self._draw_graph(d["graph_history"])
+        if "tournament" in d:
+            self._render_tournament(d["tournament"])
         if "game_over" in d:
             self._set_game_over_btn()
         if "reset_play_btn" in d:
@@ -1629,9 +3004,17 @@ class Game:
         resume_event: Optional[threading.Event] = None,
         black_time: Optional[float] = None,
         black_increment: Optional[float] = None,
+        event: str = "Engine game",
+        round_: str = "-",
+        save_record: bool = True,
     ):
         """total_time/increment apply to White (and to Black unless
-        black_time/black_increment are given)."""
+        black_time/black_increment are given). Finished games are saved to
+        GAMES_DIR unless save_record is False."""
+        self.event        = event
+        self.round        = round_
+        self.save_record  = save_record
+        self.record_path: Optional[str] = None
         self.white        = white
         self.black        = black
         self.white_total  = total_time
@@ -1647,25 +3030,30 @@ class Game:
         self.white_eval: Optional[str] = None
         self.black_eval: Optional[str] = None
         self._move_texts: list[str]    = []
-        # Per-ply eval lists, normalised to White's POV, parallel + same length
-        self._w_evals: list[Optional[float]] = []
-        self._b_evals: list[Optional[float]] = []
+        # Per-ply stats per side, parallel + same length (None on the other
+        # side's plies). Evals are normalised to White's POV.
+        self._hist: dict = {m: ([], []) for m in GRAPH_METRICS}
+        self.reason: str = ""   # how the game ended, e.g. "checkmate", "time forfeit"
+        self.reason_detail: str = ""   # e.g. "illegal move e2e5"
+        # Engine that probably crashed or hung (see _is_unresponsive); the
+        # caller restarts it after the game
+        self.crashed_engine: Optional[UCIEngine] = None
 
     def _gui(self, **kw):
         if self.gui:
             self.gui.update(**kw)
 
-    def _push_eval(self, score: Optional[str], turn: chess.Color):
+    def _push_stats(self, score: Optional[str], depth: Optional[int],
+                    nodes: Optional[int], turn: chess.Color):
         v = parse_eval(score)
         # Normalise to White's POV: negate when it's Black's score
         norm = (v if turn == chess.WHITE else (-v if v is not None else None))
-        if turn == chess.WHITE:
-            self._w_evals.append(norm)
-            self._b_evals.append(None)
-        else:
-            self._w_evals.append(None)
-            self._b_evals.append(norm)
-        self._gui(eval_history=(list(self._w_evals), list(self._b_evals)))
+        side = 0 if turn == chess.WHITE else 1
+        for metric, val in (("eval", norm), ("depth", depth), ("nodes", nodes)):
+            lists = self._hist[metric]
+            lists[side].append(val)
+            lists[1 - side].append(None)
+        self._gui(graph_history={m: (list(w), list(b)) for m, (w, b) in self._hist.items()})
 
     def run(self) -> Tuple[str, chess.pgn.Game]:
         self.white.new_game()
@@ -1698,12 +3086,22 @@ class Game:
         )
 
         pgn_game = chess.pgn.Game()
+        now = datetime.datetime.now()
         pgn_game.headers.update({
+            "Event":  self.event,
+            "Site":   f"chess_player {__version__}",
+            "Date":   now.strftime("%Y.%m.%d"),
+            "Round":  self.round,
             "White":  w,
             "Black":  b,
-            "Date":   datetime.date.today().strftime("%Y.%m.%d"),
             "Result": "*",
+            "Time":   now.strftime("%H:%M:%S"),
         })
+        if (self.white_total, self.white_inc) == (self.black_total, self.black_inc):
+            pgn_game.headers["TimeControl"] = f"{self.white_total:g}+{self.white_inc:g}"
+        else:
+            pgn_game.headers["WhiteTimeControl"] = f"{self.white_total:g}+{self.white_inc:g}"
+            pgn_game.headers["BlackTimeControl"] = f"{self.black_total:g}+{self.black_inc:g}"
         pgn_node = pgn_game
         result   = "*"
         move_num = 1
@@ -1802,6 +3200,9 @@ class Game:
             flagged = self.wtime if turn == chess.WHITE else self.btime
             if flagged < 0:
                 result = "0-1" if turn == chess.WHITE else "1-0"
+                self.reason = "time forfeit"
+                if _is_unresponsive(engine, elapsed):
+                    self.crashed_engine = engine
                 print(f"\n  *** {engine.name} FLAGGED (ran out of time) ***")
                 print(f"  Result: {result} — {opp.name} wins on time\n")
                 self._gui(status=f"{engine.name} ran out of time! {opp.name} wins — {result}", game_over=True)
@@ -1810,6 +3211,9 @@ class Game:
             # ── No move ──
             if move_uci is None:
                 result = "0-1" if turn == chess.WHITE else "1-0"
+                self.reason = "no move"
+                if _is_unresponsive(engine, elapsed):
+                    self.crashed_engine = engine
                 print(f"\n  *** {engine.name} returned no move ***")
                 print(f"  Result: {result} — {opp.name} wins\n")
                 self._gui(status=f"{engine.name} failed to respond! {opp.name} wins — {result}", game_over=True)
@@ -1820,6 +3224,8 @@ class Game:
                 move = chess.Move.from_uci(move_uci)
             except ValueError:
                 result = "0-1" if turn == chess.WHITE else "1-0"
+                self.reason = "malformed move"
+                self.reason_detail = f"malformed move {move_uci!r}"
                 print(f"\n  *** {engine.name} returned malformed move: {move_uci!r} ***")
                 print(f"  Result: {result} — {opp.name} wins\n")
                 self._gui(status=f"{engine.name} malformed move! {opp.name} wins — {result}", game_over=True)
@@ -1827,6 +3233,8 @@ class Game:
 
             if move not in self.board.legal_moves:
                 result = "0-1" if turn == chess.WHITE else "1-0"
+                self.reason = "illegal move"
+                self.reason_detail = f"illegal move {move_uci}"
                 print(f"\n  *** {engine.name} played ILLEGAL move: {move_uci} ***")
                 print(f"  Result: {result} — {opp.name} wins\n")
                 self._gui(status=f"{engine.name} illegal move! {opp.name} wins — {result}", game_over=True)
@@ -1838,7 +3246,10 @@ class Game:
                 self.gui.animate_move(self.board, move, stop_event=self.stop_event)
             self.board.push(move)
             pgn_node = pgn_node.add_variation(move)
-            self._push_eval(score, turn)
+            if score:
+                pgn_node.comment = score
+            pgn_node.set_clock(max(0.0, self.wtime if turn == chess.WHITE else self.btime))
+            self._push_stats(score, engine.last_depth, engine.last_nodes, turn)
 
             score_str  = f" [{score}]" if score else ""
             print(f"{prefix} {san:<9s}{score_str}  ({elapsed:.2f}s)", flush=True)
@@ -1869,6 +3280,7 @@ class Game:
             result  = self.board.result(claim_draw=True)
             outcome = self.board.outcome(claim_draw=True)
             reason  = outcome.termination.name.replace("_", " ").title() if outcome else "draw"
+            self.reason = reason.lower()
             verdict = (f"{self.white.name} wins" if result == "1-0" else
                        f"{self.black.name} wins" if result == "0-1" else "Draw")
             print(f"\n{sep}")
@@ -1878,12 +3290,54 @@ class Game:
             self._gui(status=f"Game over — {reason} — {result} ({verdict})", active=None, game_over=True)
 
         pgn_game.headers["Result"] = result
+        if result != "*":
+            winner = (self.white.name if result == "1-0" else
+                      self.black.name if result == "0-1" else "draw")
+            pgn_game.headers["Winner"] = winner
+            pgn_game.headers["Reason"] = self.reason_detail or self.reason
+            pgn_game.headers["Termination"] = (
+                "time forfeit" if self.reason == "time forfeit" else
+                "rules infraction" if self.reason in ("illegal move", "malformed move", "no move")
+                else "normal")
+            if self.save_record:
+                self.record_path = _save_game_record(pgn_game)
+                if self.record_path:
+                    print(f"  Game saved -> {self.record_path}")
         return result, pgn_game
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Summary
 # ──────────────────────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Crashed / hung engines
+# ──────────────────────────────────────────────────────────────────────────────
+
+# An engine that loses on time (or without a move) after thinking at least this
+# long on its last move has probably crashed or hung, and is restarted.
+HUNG_AFTER_S = 10.0
+
+def _is_unresponsive(engine: UCIEngine, elapsed: float) -> bool:
+    exited = engine.process is not None and engine.process.poll() is not None
+    return exited or elapsed >= HUNG_AFTER_S
+
+def _restart_engine(old: UCIEngine) -> UCIEngine:
+    """Kill `old` and start a fresh process of the same engine, with the
+    options the user changed re-applied. Raises on failure."""
+    try:
+        old.quit()   # kills the process if it does not respond to 'quit'
+    except Exception:
+        pass
+    new = UCIEngine(old.path, old.name)
+    new.start()
+    for name, opt in old.options.items():
+        if (opt["type"] != "button" and opt["value"] is not None
+                and opt["value"] != opt["default"] and name in new.options):
+            new.set_option(name, opt["value"])
+            new.options[name]["value"] = opt["value"]
+    return new
+
 
 def print_summary(result: str, white: UCIEngine, black: UCIEngine):
     print("RESULT:", result)
@@ -1975,6 +3429,7 @@ Examples:
         "white": None, "black": None,
         "game_launched": False,
         "tc": tc,
+        "tournament": None,   # {"stop", "engines", "thread"} while one runs
     }
 
     def _start_engine(path, required: bool):
@@ -1997,13 +3452,34 @@ Examples:
             return None
         return eng
 
-    # Command-line engines take precedence; otherwise restore last session's
-    last = _load_last_engines()
-    for key, cli_path in (("white", args.white_engine), ("black", args.black_engine)):
-        if cli_path:
-            state[key] = _start_engine(cli_path, required=True)
-        elif last.get(key) and os.path.isfile(last[key]):
-            state[key] = _start_engine(last[key], required=False)
+    # Command-line engines take precedence; otherwise restore last session's.
+    # This can take a while, so a splash window shows that the app is starting.
+    splash = _Splash.create()
+
+    def _startup():
+        last = _load_last_engines()
+        for key, cli_path in (("white", args.white_engine), ("black", args.black_engine)):
+            path = cli_path or (last.get(key) if last.get(key) and os.path.isfile(last[key]) else None)
+            if not path:
+                continue
+            if splash:
+                splash.status = f"Starting {os.path.splitext(os.path.basename(path))[0]}…"
+            state[key] = _start_engine(path, required=bool(cli_path))
+        if splash:
+            splash.status = "Loading…"
+        try:   # preload the graphics libraries the main window needs
+            import PIL.Image, PIL.ImageTk, PIL.ImageDraw  # noqa: F401
+            import numpy  # noqa: F401
+        except ImportError:
+            pass
+
+    if splash:
+        try:
+            splash.run(_startup)
+        finally:
+            splash.close()
+    else:
+        _startup()
 
     engines_ready = state["white"] is not None and state["black"] is not None
     white_name = state["white"].name if state["white"] else "—"
@@ -2027,10 +3503,36 @@ Examples:
 
         def run():
             state["result"], state["pgn"] = game.run()
+            if game.crashed_engine is not None:
+                replace_crashed_engine(game.crashed_engine)
 
         t = threading.Thread(target=run, daemon=True)
         state["thread"] = t
         t.start()
+
+    def replace_crashed_engine(old: UCIEngine):
+        """Game thread: restart an engine that stopped responding."""
+        key = ("white" if state["white"] is old else
+               "black" if state["black"] is old else None)
+        if key is None:
+            return   # already replaced (engine changed meanwhile)
+        print(f"  {old.name} stopped responding — restarting it")
+        gui.update(status=f"{old.name} stopped responding — restarting it…")
+        try:
+            new = _restart_engine(old)
+        except Exception as e:
+            print(f"  {old.name}: restart failed ({e})")
+            gui.update(status=f"{old.name} stopped responding and could not be restarted: {e}")
+            return
+        if state[key] is not old:   # replaced by the user meanwhile
+            new.quit()
+            return
+        state[key] = new
+
+        def _done():
+            gui.set_engines(state["white"], state["black"])
+            gui.update(status=f"{old.name} stopped responding and was restarted")
+        gui.update(call=_done)
 
     def restart():
         state["stop"].set()
@@ -2089,17 +3591,252 @@ Examples:
     def apply_settings(new_tc: dict):
         state["tc"] = new_tc
         _save_time_settings(new_tc)
-        if gui.game_in_progress:
+        if gui.tournament_running:
+            gui.update(status="Time control saved — applies to normal games")
+        elif gui.game_in_progress:
             gui.update(status="Time control saved — applies from the next game")
         elif state["game_launched"]:
             restart()   # not started yet / game over: reload clocks now
+
+    # ── Tournament mode ──
+    # Tournament games use their own engine processes, so the White/Black
+    # engines of normal mode stay loaded and come back when it ends.
+
+    def start_tournament(cfg: dict):
+        """cfg: a new tournament from the setup dialog ({"engines", "format",
+        "count", "time", "inc"}), or {"resume": state} to continue a saved one.
+        A tournament always starts paused: the first game waits for ▶."""
+        if state["tournament"] is not None:
+            return
+        tour = {"stop": threading.Event(), "engines": [], "thread": None, "save": False}
+        state["tournament"] = tour
+        state["stop"].set()          # stop any normal game
+        gui.enter_tournament_mode(paused=True)
+        t = threading.Thread(target=run_tournament, args=(cfg, tour), daemon=True)
+        tour["thread"] = t
+        t.start()
+
+    def stop_tournament(save: bool = False):
+        tour = state["tournament"]
+        if tour:
+            tour["save"] = save
+            tour["stop"].set()
+            gui.update(status="Stopping tournament…")
+
+    def run_tournament(cfg: dict, tour: dict):
+        """Tournament thread. The state (engines, time control, pairings and
+        results so far) is autosaved to _CURRENT_TOURNAMENT_FILE whenever it
+        changes, so an app that is closed mid-tournament resumes it on the
+        next start; the game that was in progress is replayed."""
+        stop = tour["stop"]
+        if state["thread"]:
+            state["thread"].join(timeout=5)   # let the normal game wind down
+        resume = cfg.get("resume")
+        if resume:
+            eng_cfg = [(e["name"], e["path"]) for e in resume["engines"]]
+            t_time, t_inc = resume["time"], resume["inc"]
+            try:   # e.g. continued from a file: make sure a crash keeps it
+                _write_json_atomic(_CURRENT_TOURNAMENT_FILE, resume)
+            except OSError as e:
+                print(f"  Could not autosave tournament: {e}")
+        else:
+            eng_cfg = cfg["engines"]
+            t_time, t_inc = cfg["time"], cfg["inc"]
+        tc_text = f"{fmt_duration(t_time)} + {t_inc:g}s"
+
+        engines, failed = [], []
+        for name, path in eng_cfg:
+            if stop.is_set():
+                break
+            gui.update(status=f"Tournament: starting {name}…")
+            eng = UCIEngine(path, name)
+            try:
+                eng.start()
+                engines.append(eng)
+                tour["engines"].append(eng)
+                _save_engine_history(path)
+            except Exception as e:
+                print(f"  {name}: failed to start ({e}) — left out of the tournament")
+                gui.update(status=f"{name} failed to start — left out")
+                failed.append(name)
+                try:
+                    eng.quit()
+                except Exception:
+                    pass
+                if resume:
+                    break   # a resumed tournament needs all of its engines
+
+        if len(engines) < 2 or stop.is_set() or (resume and failed):
+            for eng in engines:
+                eng.quit()
+            if stop.is_set():
+                msg = "Tournament stopped"
+            elif resume:
+                msg = f"Could not resume the tournament: {failed[0]} failed to start"
+            else:
+                msg = "Tournament aborted: fewer than 2 engines started"
+            ask = (f"{msg}.\n\nSave the tournament to a file so you can continue it later?"
+                   if resume and not stop.is_set() else None)
+            gui.update(call=lambda: finish_tournament(None, msg, final_state=resume, ask=ask))
+            return
+
+        if resume:
+            tourney = Tournament.from_dict(resume["tournament"])
+        else:
+            tourney = Tournament([e.name for e in engines], cfg["format"], cfg["count"])
+        fmt_name = "Round robin" if tourney.fmt == "rr" else "Swiss"
+
+        def make_state() -> dict:
+            return {"kind": "chess_player tournament",
+                    "version": _TOURNAMENT_STATE_VERSION,
+                    "saved": datetime.datetime.now().isoformat(timespec="seconds"),
+                    "engines": [{"name": e.name, "path": os.path.abspath(e.path)}
+                                for e in engines],
+                    "time": t_time, "inc": t_inc,
+                    "tournament": tourney.to_dict()}
+
+        def autosave():
+            try:
+                _write_json_atomic(_CURRENT_TOURNAMENT_FILE, make_state())
+            except OSError as e:
+                print(f"  Could not autosave tournament: {e}")
+
+        autosave()
+        gui.update(tournament=tourney.snapshot("running", tc_text))
+
+        def wait_resume() -> bool:
+            """Block while paused. False if the tournament was stopped."""
+            if not gui._resume_event.is_set() and not stop.is_set():
+                gui.update(status="Tournament paused — press ▶ to play the next game")
+            while not gui._resume_event.wait(timeout=0.1):
+                if stop.is_set():
+                    return False
+            return not stop.is_set()
+
+        for rnd in range(tourney.total_rounds):
+            if stop.is_set():
+                break
+            pairs, bye = tourney.pairings(rnd)
+            if bye is not None and tourney.fmt == "swiss" and not tourney.has_bye(rnd):
+                tourney.record_bye(rnd, bye)
+            autosave()   # fixes this round's pairings
+            for wi, bi in pairs:
+                if tourney.has_game(rnd, wi, bi):
+                    continue   # played before the tournament was resumed
+                if not wait_resume():
+                    break
+                we, be = engines[wi], engines[bi]
+                tourney.current = (rnd, wi, bi)
+                ready = threading.Event()
+
+                def _prep(we=we, be=be, ready=ready):
+                    gui.prepare_tournament_game(we, be)
+                    ready.set()
+
+                gui.update(call=_prep, tournament=tourney.snapshot("running", tc_text))
+                ready.wait(timeout=5)
+                print(f"\n=== Tournament round {rnd + 1}, game {len(tourney.games) + 1}"
+                      f"/{tourney.total_games}: {we.name} vs {be.name} ===")
+                game = Game(we, be, t_time, t_inc, gui, stop,
+                            resume_event=gui._resume_event,
+                            event=f"{fmt_name} tournament", round_=str(rnd + 1))
+                result, _pgn = game.run()
+                tourney.current = None
+                crashed = game.crashed_engine
+                if crashed is not None and not stop.is_set():
+                    # Restart it so it can play its remaining games
+                    print(f"  {crashed.name} stopped responding — restarting it")
+                    gui.update(status=f"{crashed.name} stopped responding — restarting it…")
+                    try:
+                        new = _restart_engine(crashed)
+                        engines[engines.index(crashed)] = new
+                        tour["engines"][tour["engines"].index(crashed)] = new
+                        print(f"  {crashed.name}: restarted")
+                    except Exception as e:
+                        print(f"  {crashed.name}: restart failed ({e})")
+                        gui.update(status=f"{crashed.name} could not be restarted: {e}")
+                if stop.is_set() or result == "*":
+                    break
+                tourney.record(rnd, wi, bi, result, game.reason)
+                autosave()
+                gui.update(tournament=tourney.snapshot("running", tc_text))
+                # Short pause so the final position and result can be seen
+                if stop.wait(timeout=2.5):
+                    break
+
+        finished = not stop.is_set()
+        for eng in engines:
+            eng.quit()
+        snap = tourney.snapshot("finished" if finished else "stopped", tc_text)
+        if finished:
+            winners = [r["name"] for r in snap["rows"] if r["rank"] == 1]
+            msg = f"Tournament finished — winner: {', '.join(winners)}"
+            print(f"\n{msg}")
+            for r in snap["rows"]:
+                print(f"  {r['rank']:>2}. {r['name']:<24} {r['points']:>5g} pts"
+                      f"   SB {r['sb']:.2f}   (+{r['wins']} ={r['draws']} -{r['losses']})")
+        else:
+            msg = "Tournament stopped"
+        final = None if finished else make_state()
+        gui.update(call=lambda: finish_tournament(snap, msg, final_state=final))
+
+    def finish_tournament(snap: Optional[dict], msg: str,
+                          final_state: Optional[dict] = None, ask: Optional[str] = None):
+        """Main thread: leave tournament mode and set up a normal game again.
+        final_state: state of an unfinished tournament, saved to a file if the
+        user asked for that (Stop and save…) or agrees to `ask`."""
+        tour = state["tournament"]
+        save = bool(tour and tour.get("save"))
+        state["tournament"] = None
+        gui.exit_tournament_mode()
+        if snap:
+            gui._render_tournament(snap)
+        else:
+            gui._close_tournament_panel()
+        w, b = state["white"], state["black"]
+        gui.set_engines(w, b)
+        gui._update_engine_name(chess.WHITE, w.name if w else "—")
+        gui._update_engine_name(chess.BLACK, b.name if b else "—")
+        gui.reset()
+        # Apply directly (not via the queue) so the next game starts paused
+        gui._apply({"play_btn_enabled": bool(w and b)})
+        gui.reset_play_button()
+        if final_state is not None and (save or ask):
+            path = gui.save_tournament_file(final_state, ask=None if save else ask)
+            if path:
+                msg += f" — saved to {os.path.basename(path)}"
+        # The tournament is over (finished, or stopped by the user): don't resume it
+        _remove_current_tournament()
+        if w and b:
+            start_game()
+            # start_game's first status update says "Press ▶"; show the result instead
+            gui.root.after(1500, lambda: gui.update(status=msg))
+        else:
+            gui.update(status=msg + " — click the player names to select engines")
+
+    gui.set_tournament_callbacks(start_tournament, stop_tournament)
 
     gui.set_settings_callbacks(lambda: state["tc"], apply_settings)
     gui.set_restart_callback(restart)
     gui.set_swap_callback(swap_colors)
     gui.set_change_engine_callback(change_engine)
 
-    if engines_ready:
+    # A tournament that was running when the app was closed: resume it
+    resume_state = None
+    if os.path.exists(_CURRENT_TOURNAMENT_FILE):
+        try:
+            resume_state = _load_tournament_file(_CURRENT_TOURNAMENT_FILE, check_engines=False)
+        except ValueError as e:
+            print(f"Ignoring saved tournament: {e}")
+            try:
+                os.replace(_CURRENT_TOURNAMENT_FILE, _CURRENT_TOURNAMENT_FILE + ".invalid")
+            except OSError:
+                pass
+
+    if resume_state:
+        print("Resuming the tournament from the last session")
+        gui.root.after(300, lambda: start_tournament({"resume": resume_state}))
+    elif engines_ready:
         start_game()
     # else: user must select engines via the GUI before ▶ is enabled
 
@@ -2108,6 +3845,12 @@ Examples:
     state["stop"].set()
     if state["thread"]:
         state["thread"].join(timeout=5)
+    tour = state["tournament"]
+    if tour:
+        tour["stop"].set()
+        tour["thread"].join(timeout=5)
+        for eng in tour["engines"]:
+            eng.quit()
 
     if state["white"]:
         state["white"].quit()
@@ -2121,6 +3864,82 @@ Examples:
 
     if state["white"] and state["black"]:
         print_summary(state["result"], state["white"], state["black"])
+
+
+class _Splash:
+    """Small borderless "starting up" window, shown while the engines start
+    (before the main window exists)."""
+
+    BG = "#1a1a1a"
+
+    @classmethod
+    def create(cls) -> Optional["_Splash"]:
+        try:
+            return cls()
+        except Exception as e:   # no display etc.: start without a splash
+            print(f"(no splash window: {e})")
+            return None
+
+    def __init__(self):
+        import tkinter as tk
+        from tkinter import ttk
+        self.status = "Starting…"   # set from any thread, shown by run()
+        self.root = r = tk.Tk()
+        r.overrideredirect(True)
+        r.attributes("-topmost", True)
+        r.configure(bg=self.BG, highlightthickness=1, highlightbackground="#444444")
+        tk.Label(r, text="♛  Chess Player", font=("Segoe UI Symbol", 18, "bold"),
+                 fg="#ffcc44", bg=self.BG).pack(padx=48, pady=(26, 0))
+        tk.Label(r, text=f"version {__version__}", font=("Consolas", 9),
+                 fg="#777777", bg=self.BG).pack()
+        self._msg = tk.Label(r, text=self.status, font=("Consolas", 10), fg="#cccccc",
+                             bg=self.BG, width=40)
+        self._msg.pack(pady=(18, 8))
+        style = ttk.Style(r)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure("Splash.Horizontal.TProgressbar", troughcolor="#2b2b2b",
+                        background="#88ff44", bordercolor=self.BG,
+                        lightcolor="#88ff44", darkcolor="#88ff44")
+        self._bar = ttk.Progressbar(r, mode="indeterminate", length=280,
+                                    style="Splash.Horizontal.TProgressbar")
+        self._bar.pack(padx=48, pady=(0, 28))
+        r.update_idletasks()
+        w, h = r.winfo_reqwidth(), r.winfo_reqheight()
+        r.geometry(f"+{(r.winfo_screenwidth() - w) // 2}+{(r.winfo_screenheight() - h) // 3}")
+        self._bar.start(12)
+        r.update()
+
+    def run(self, fn):
+        """Run fn() in a worker thread while keeping the splash animated.
+        Returns fn's result; re-raises its exception (incl. SystemExit)."""
+        box: dict = {}
+
+        def work():
+            try:
+                box["result"] = fn()
+            except BaseException as e:
+                box["error"] = e
+
+        t = threading.Thread(target=work, daemon=True)
+        t.start()
+        while t.is_alive():
+            if self._msg.cget("text") != self.status:
+                self._msg.config(text=self.status)
+            self.root.update()
+            time.sleep(0.015)
+        if "error" in box:
+            raise box["error"]
+        return box.get("result")
+
+    def close(self):
+        try:
+            self._bar.stop()
+            self.root.destroy()
+        except Exception:
+            pass
 
 
 def _show_error_dialog(msg: str):

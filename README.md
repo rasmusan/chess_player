@@ -110,12 +110,44 @@ White (rubberduck5.1-duration) — 00:05.0 remaining
 
 ## GUI window
 
-Unless `--nogui` is passed, a window opens showing:
+Unless `--nogui` is passed, a small splash window shows progress while the engines start, then the main window opens showing:
 
 - **Chess board** with the last move highlighted
 - **Player panels** (top = Black, bottom = White) with engine name, clock, and live evaluation
 - The active player's panel is highlighted while they are thinking
 - A running move list along the bottom
+- A **graph panel** next to the board. Use the *Eval*, *Depth* and *Nodes* toggles at its top to choose what it shows. Selected graphs are stacked, each in its own box. The choice is remembered in `.gui_settings.json`.
+  - *Eval*: each engine's evaluation, from `info score cp` / `info score mate`
+  - *Depth*: the search depth each engine reached per move, from `info depth`
+  - *Nodes*: nodes searched per move, from `info nodes`, on a log scale
+
+  If an engine never reports a value, its line is missing from that graph.
+
+The window can be resized and maximized (not made smaller than its starting size). The board grows to the largest square that fits, and the graph takes the remaining width.
+
+Click **⚙** to set the time control and the **font size** (7–24, default 10). The font size applies to the whole window at once and is remembered in `.gui_settings.json`.
+
+## Tournament mode
+
+Click **♛ Tournament** to set up a tournament:
+
+- **Engines:** select 2 or more from the list. *Add engine…* adds one from disk.
+- **Format:**
+  - *Round robin*: set the number of **rounds**. In each round every engine plays every other engine once. Colors are reversed in every second round.
+  - *Swiss*: set the number of **matches per engine**. Each round pairs engines with equal or similar scores that have not met yet, and balances colors. With an odd number of engines, one engine sits out each round and gets a bye worth 1 point.
+- **Time / increment:** the time control for all tournament games. It is separate from the ⚙ setting for normal games.
+- **Continue from file…:** continue a tournament saved earlier (see below).
+
+While the tournament runs, a panel to the right of the graph shows the standings and the most recent results, newest first. The two engines in the current game are shown in green, with a white pawn ♙ or black pawn ♟ next to their names. A tournament always starts paused: press ▶ to play the first game (or the next game of a continued tournament). After that, games follow each other automatically. Engine names too long for the table or the results list are cut off with …; hover over them to see the full name. ▶/⏸ pauses and resumes the tournament, and ■ stops it.
+
+**Saving and resuming:**
+
+- The running tournament is saved automatically after every game, in `.current_tournament.json`. If the app is closed during a tournament, it is restored on the next start, paused. The game that was in progress is replayed from the start.
+- When you press ■, choose **Stop and save…** to save the tournament to a `.json` file (by default in the `tournaments` folder). Later, open the tournament dialog and click **Continue from file…** to continue it with the same engines, time control, pairings and results.
+
+The standings are sorted by points, then by the **SB** tie-break (Sonneborn-Berger). An engine's SB is the sum of the final scores of the opponents it beat, plus half the scores of the opponents it drew with. Win = 1, draw = ½, loss = 0.
+
+Tournament engines run as separate processes. When the tournament ends, the normal White and Black engines come back. The final standings stay visible until you close the panel with ✕. The last tournament setup is saved in `.tournament_settings.json`.
 
 ## Result and adjudication
 
@@ -132,7 +164,24 @@ The game ends and a winner is declared when:
 | Engine plays an illegal move | That engine loses |
 | Engine returns no move / times out | That engine loses |
 
+If an engine loses on time or without a move after thinking for 10 seconds or more on its last move, or its process has exited, it has probably crashed or hung. It is then restarted after the game, also in the middle of a tournament, so it can play its next games. Engine options you changed in its log window are applied again.
+
 The final result (`1-0`, `0-1`, or `1/2-1/2`) is printed to the console. If `--pgn` is given, it is also written to the PGN file.
+
+## Game records
+
+Every finished game is saved as a PGN file in the `games` folder of the user data folder (`%APPDATA%\chess_player\games\` for the installed app, the script's folder when run from source). This includes normal games, tournament games and `--nogui` games. Games stopped before they end are not saved.
+
+Each file contains the moves, with each engine's evaluation and remaining clock time per move, and these headers:
+
+| Header | Content |
+|---|---|
+| `Event`, `Round` | `Engine game`, or e.g. `Round robin tournament` and the round number |
+| `White`, `Black`, `Result` | Engines and result |
+| `Winner` | Name of the winning engine, or `draw` |
+| `Reason` | How the game ended, e.g. `checkmate`, `threefold repetition`, `time forfeit`, `illegal move e2e5` |
+| `Termination` | Standard PGN value: `normal`, `time forfeit` or `rules infraction` |
+| `TimeControl` | e.g. `60+0` (or `WhiteTimeControl`/`BlackTimeControl` when they differ) |
 
 ## Engine compatibility
 

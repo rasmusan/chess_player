@@ -8,3 +8,10 @@ engines/
 build/
 dist/
 .last_engines.json
+.time_settings.json
+.gui_settings.json
+.tournament_settings.json
+.current_tournament.json
+.current_tournament.json.invalid
+games/
+tournaments/
