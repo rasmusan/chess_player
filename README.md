@@ -137,10 +137,15 @@ Click **♛ Tournament** to set up a tournament:
   - *Swiss*: set the number of **matches per engine**. Each round pairs engines with equal or similar scores that have not met yet, and balances colors. Within a round, the bottom boards are played first, so the leaders meet last. With an odd number of engines, one engine sits out each round and gets a bye worth 1 point.
 - **Time / increment:** the time control for all tournament games. It is separate from the ⚙ setting for normal games.
 - **Pause before each match:** the tournament pauses before every game, showing the next pairing; press ▶ to play it.
-- **Extend the finished tournament:** after a tournament has finished, open the dialog again with the same engines and format and raise the number of rounds / matches. This option then appears (on by default) and continues the finished tournament with the extra games, keeping its results.
+- **Extend the finished tournament:** after a tournament has finished (also after restarting the app), open the dialog again with the same engines and format and raise the number of rounds / matches. This option then appears (on by default) and continues the finished tournament with the extra games, keeping its results.
 - **Continue from file…:** continue a tournament saved earlier (see below).
 
 While the tournament runs, a panel to the right of the graph shows the standings and the most recent results, newest first. The two engines in the current game are shown in green, with a white pawn ♙ or black pawn ♟ next to their names. A tournament always starts paused, with the first pairing shown on the board: press ▶ to play the first game (or the next game of a continued tournament). After that, games follow each other automatically. Engine names too long for the table or the results list are cut off with …; hover over them to see the full name. ▶/⏸ pauses and resumes the tournament, and ■ stops it.
+
+While the tournament is paused, **♛ Tournament** can still be pressed:
+
+- Before the first game has started, it opens the full setup, so you can add or remove engines and change the format, rounds, time control or auto-pause. *Start* restarts the tournament with the new setup.
+- After that, you can change the number of rounds / matches per engine (not below the round in progress) and *Pause before each match*.
 
 **Saving and resuming:**
 

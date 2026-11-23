@@ -30,7 +30,7 @@ import time
 from typing import Optional, Tuple
 
 # Single source of truth for the version. build.ps1 reads (and bumps) this line.
-__version__ = "1.2.2"
+__version__ = "1.3.0"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -512,6 +512,8 @@ def _save_game_record(pgn_game) -> Optional[str]:
 # ──────────────────────────────────────────────────────────────────────────────
 
 _CURRENT_TOURNAMENT_FILE = os.path.join(DATA_DIR, ".current_tournament.json")
+# The last finished tournament, kept so that it can be extended later
+_FINISHED_TOURNAMENT_FILE = os.path.join(DATA_DIR, ".finished_tournament.json")
 TOURNAMENTS_DIR          = os.path.join(DATA_DIR, "tournaments")
 _TOURNAMENT_STATE_VERSION = 1
 
@@ -628,6 +630,29 @@ class Tournament:
         else:
             self.total_rounds = self.count
             self.total_games  = self.count * (self.n // 2)
+
+    def set_count(self, count: int):
+        """Change the number of rounds (rr) / matches per engine (swiss) of a
+        running tournament. Earlier rounds keep their pairings."""
+        self.count = max(1, int(count))
+        if self.fmt == "rr":
+            rr = self._round_robin_schedule()
+            self.total_games  = sum(len(pairs) for pairs, _ in rr)
+            self._rr = rr
+            self.total_rounds = len(rr)
+        else:
+            self.total_games  = self.count * (self.n // 2)
+            self.total_rounds = self.count
+            for r in [r for r in self._pairings if r >= self.count]:
+                del self._pairings[r]
+
+    def min_count(self, started_round: int) -> int:
+        """Smallest count that keeps round `started_round` (0-based) and the
+        rounds before it."""
+        if self.fmt == "rr":
+            per_cycle = len(self._rr) // self.count
+            return started_round // per_cycle + 1
+        return started_round + 1
 
     # ── Results ──
 
@@ -947,6 +972,8 @@ class ChessGUI:
         self._tournament_running  = False
         self._tournament_start_cb = None
         self._tournament_stop_cb  = None
+        self._tournament_info_cb = self._tournament_edit_cb = None
+        self._tournament_restart_cb = None
         self._last_tournament_snap: Optional[dict] = None
         # State of the last finished tournament, which can be extended
         self._finished_tournament: Optional[dict] = None
@@ -1059,10 +1086,17 @@ class ChessGUI:
     def set_swap_callback(self, cb):
         self._swap_cb = cb
 
-    def set_tournament_callbacks(self, start_cb, stop_cb):
-        """start_cb(cfg dict) starts a tournament; stop_cb() aborts it."""
-        self._tournament_start_cb = start_cb
-        self._tournament_stop_cb  = stop_cb
+    def set_tournament_callbacks(self, start_cb, stop_cb, info_cb=None,
+                                 edit_cb=None, restart_cb=None):
+        """start_cb(cfg dict) starts a tournament; stop_cb() aborts it.
+        While paused: info_cb() describes the running tournament, edit_cb(ch)
+        changes its rounds / auto-pause, restart_cb(cfg) replaces it (only
+        before its first game)."""
+        self._tournament_start_cb   = start_cb
+        self._tournament_stop_cb    = stop_cb
+        self._tournament_info_cb    = info_cb
+        self._tournament_edit_cb    = edit_cb
+        self._tournament_restart_cb = restart_cb
 
     @property
     def tournament_running(self) -> bool:
@@ -2551,7 +2585,7 @@ class ChessGUI:
             self._resume_event.set()
             self._play_btn.config(state="normal", text="⏸", fg="#ffaa44", cursor="hand2")
         self._action_btn.config(state="normal", cursor="hand2")
-        self._tourn_btn.config(state="disabled", cursor="")
+        self._update_tourn_btn()
         self._t_close.config(fg="#444444", cursor="")
         self._bn.config(cursor="")
         self._wn.config(cursor="")
@@ -2592,15 +2626,27 @@ class ChessGUI:
         """Back to normal buttons. The panel stays until closed with ✕. Main thread."""
         self._tournament_running = False
         self._think_start = None
-        self._tourn_btn.config(state="normal", cursor="hand2")
+        self._update_tourn_btn()
         self._t_close.config(fg="#aaaaaa", cursor="hand2")
         self._update_action_btn()
 
     # ── Tournament setup dialog ──
 
     def _open_tournament_dialog(self):
-        if self._tournament_running or not self._tournament_start_cb:
+        if not self._tournament_start_cb:
             return
+        start_cb = self._tournament_start_cb
+        restart = None   # info on a running tournament that can be set up anew
+        if self._tournament_running:
+            if self._resume_event.is_set() or not self._tournament_info_cb:
+                return
+            info = self._tournament_info_cb()
+            if info is None:
+                return
+            if not info["fresh"]:
+                self._open_tournament_edit(info)
+                return
+            restart, start_cb = info, self._tournament_restart_cb
         tk = self._tk
         BG, FG, DIM = "#1a1a1a", "#cccccc", "#888888"
         ENTRY = dict(font=self._font(10), width=9, bg="#2e2e2e", fg="white",
@@ -2608,6 +2654,11 @@ class ChessGUI:
                      highlightthickness=1, highlightbackground="#444444",
                      highlightcolor="#55aaff", justify="right")
         saved = _load_tournament_settings()
+        if restart:   # show the setup of the paused tournament
+            cnt_key = "rr_rounds" if restart["format"] == "rr" else "swiss_matches"
+            saved = {**saved, "engines": restart["engines"], "format": restart["format"],
+                     cnt_key: restart["count"], "time": restart["time"],
+                     "inc": restart["inc"], "auto_pause": restart["auto_pause"]}
         tc = self._settings_get_cb() if self._settings_get_cb else _default_time_control()
 
         items = [(disp, path) for disp, path, _ in _engine_candidates()]
@@ -2843,7 +2894,7 @@ class ChessGUI:
                 st = {**ft, "tournament": {**ft["tournament"], "count": count},
                       "time": t, "inc": inc, "auto_pause": auto_var.get()}
                 win.destroy()
-                self._tournament_start_cb({"resume": st})
+                start_cb({"resume": st})
                 return
             # Unique display names (two engines may share a file name)
             names, used = [], {}
@@ -2855,7 +2906,7 @@ class ChessGUI:
                    "count": count, "time": t, "inc": inc,
                    "auto_pause": auto_var.get()}
             win.destroy()
-            self._tournament_start_cb(cfg)
+            start_cb(cfg)
 
         def _continue():
             from tkinter import filedialog
@@ -2872,7 +2923,7 @@ class ChessGUI:
                 return
             st["auto_pause"] = auto_var.get()
             win.destroy()
-            self._tournament_start_cb({"resume": st})
+            start_cb({"resume": st})
 
         tk.Button(win, text="Continue from file…", font=self._font(9), bg="#3a3a3a",
                   fg="#ffcc44", relief="flat", padx=10, pady=4, activebackground="#555555",
@@ -2889,13 +2940,89 @@ class ChessGUI:
                   bg="#3a3a3a", fg="#aaaaaa", relief="flat", padx=12, pady=4,
                   activebackground="#555555", activeforeground="white",
                   cursor="hand2", command=win.destroy).pack(side="left")
-        if self.game_in_progress:
+        if restart:
+            tk.Label(win, text="Start restarts the paused tournament with this setup.",
+                     font=self._font(9), fg="#ffaa44", bg=BG
+                     ).grid(row=11, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        elif self.game_in_progress:
             tk.Label(win, text="Starting a tournament stops the current game.",
                      font=self._font(9), fg="#ffaa44", bg=BG
                      ).grid(row=11, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
         win.bind("<Escape>", lambda e: win.destroy())
         win.bind("<Return>", _start)
+
+        win.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width()  - win.winfo_reqwidth())  // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - win.winfo_reqheight()) // 3
+        win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        win.grab_set()
+        win.wait_window()
+
+    def _open_tournament_edit(self, info: dict):
+        """While a started tournament is paused: change the number of rounds /
+        matches and auto-pause. The engines and time control stay fixed."""
+        tk = self._tk
+        BG, FG, DIM = "#1a1a1a", "#cccccc", "#888888"
+        win = tk.Toplevel(self.root)
+        win.title("Tournament")
+        win.configure(bg=BG, padx=18, pady=14)
+        win.resizable(False, False)
+        win.transient(self.root)
+
+        fmt_name = "Round robin" if info["format"] == "rr" else "Swiss"
+        tk.Label(win, text=f"Tournament · {fmt_name}", font=self._font(12, "bold"),
+                 fg="white", bg=BG).grid(row=0, column=0, columnspan=3,
+                                         sticky="w", pady=(0, 10))
+        tk.Label(win, text="Rounds:" if info["format"] == "rr" else "Matches per engine:",
+                 font=self._font(10), fg=FG, bg=BG, width=20, anchor="w"
+                 ).grid(row=1, column=0, sticky="w")
+        count_var = tk.StringVar(value=str(info["count"]))
+        tk.Spinbox(win, from_=info["min_count"], to=999, textvariable=count_var,
+                   width=5, font=self._font(10), bg="#2e2e2e", fg="white",
+                   relief="flat", buttonbackground="#3a3a3a",
+                   insertbackground="white", justify="right").grid(row=1, column=1, sticky="w")
+        tk.Label(win, text=f"(at least {info['min_count']})", font=self._font(9),
+                 fg=DIM, bg=BG).grid(row=1, column=2, sticky="w", padx=(10, 0))
+        auto_var = tk.BooleanVar(value=info["auto_pause"])
+        tk.Checkbutton(win, text="Pause before each match", variable=auto_var,
+                       font=self._font(10), fg=FG, bg=BG, selectcolor="#2e2e2e",
+                       activebackground=BG, activeforeground="white", cursor="hand2"
+                       ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        tk.Label(win, text="Engines can only be changed before the first game.",
+                 font=self._font(9), fg=DIM, bg=BG
+                 ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        msg = tk.Label(win, text="", font=self._font(9), fg="#ff5533", bg=BG)
+        msg.grid(row=4, column=0, columnspan=3, sticky="w", pady=(4, 0))
+
+        def _ok(event=None):
+            try:
+                count = int(count_var.get())
+                if not info["min_count"] <= count <= 999:
+                    raise ValueError
+            except ValueError:
+                msg.config(text=f"Enter a number from {info['min_count']} to 999.")
+                return
+            win.destroy()
+            if self._tournament_edit_cb and self._tournament_running:
+                self._tournament_edit_cb({"count": count, "auto_pause": auto_var.get()})
+                saved = _load_tournament_settings()
+                key = "rr_rounds" if info["format"] == "rr" else "swiss_matches"
+                _save_tournament_settings({**saved, key: count,
+                                           "auto_pause": auto_var.get()})
+
+        bf = tk.Frame(win, bg=BG)
+        bf.grid(row=5, column=0, columnspan=3, sticky="e", pady=(12, 0))
+        tk.Button(bf, text="OK", font=self._font(9),
+                  bg="#2a4a00", fg="#88ff44", relief="flat", padx=14, pady=4,
+                  activebackground="#3a6a00", activeforeground="#aaff66",
+                  cursor="hand2", command=_ok).pack(side="left", padx=(0, 8))
+        tk.Button(bf, text="Cancel", font=self._font(9),
+                  bg="#3a3a3a", fg="#aaaaaa", relief="flat", padx=12, pady=4,
+                  activebackground="#555555", activeforeground="white",
+                  cursor="hand2", command=win.destroy).pack(side="left")
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.bind("<Return>", _ok)
 
         win.update_idletasks()
         x = self.root.winfo_rootx() + (self.root.winfo_width()  - win.winfo_reqwidth())  // 2
@@ -2937,9 +3064,11 @@ class ChessGUI:
         if self._resume_event.is_set():
             self._resume_event.clear()
             self._play_btn.config(text="▶", fg="#88ff44")
+            self._update_tourn_btn()
         else:
             self._resume_event.set()
             self._play_btn.config(text="⏸", fg="#ffaa44")
+            self._update_tourn_btn()
             if not self._game_started:
                 self._game_started = True
                 self._bn.config(cursor="")
@@ -2950,6 +3079,13 @@ class ChessGUI:
         """Show ▶ after the tournament paused itself. Main thread."""
         if self._tournament_running and not self._resume_event.is_set():
             self._play_btn.config(text="▶", fg="#88ff44")
+        self._update_tourn_btn()
+
+    def _update_tourn_btn(self):
+        """♛ Tournament works when no tournament runs, or while it is paused."""
+        ok = not self._tournament_running or not self._resume_event.is_set()
+        self._tourn_btn.config(state="normal" if ok else "disabled",
+                               cursor="hand2" if ok else "")
 
     def _set_game_over_btn(self):
         if self._tournament_running:
@@ -3663,6 +3799,10 @@ Examples:
         tour = {"stop": threading.Event(), "engines": [], "thread": None, "save": False}
         state["tournament"] = tour
         gui._finished_tournament = None
+        try:
+            os.remove(_FINISHED_TOURNAMENT_FILE)
+        except OSError:
+            pass
         state["stop"].set()          # stop any normal game
         gui.enter_tournament_mode(paused=True)
         t = threading.Thread(target=run_tournament, args=(cfg, tour), daemon=True)
@@ -3675,6 +3815,49 @@ Examples:
             tour["save"] = save
             tour["stop"].set()
             gui.update(status="Stopping tournament…")
+
+    def tournament_info() -> Optional[dict]:
+        """Main thread: what the running tournament allows to change, for
+        the Tournament dialog while paused. None while engines are starting."""
+        tour = state["tournament"]
+        ctl = tour and tour.get("ctl")
+        if not ctl:
+            return None
+        with ctl["lock"]:
+            t = ctl["tourney"]
+            fresh = not t.games and not ctl["game_started"]
+            min_c = 1 if fresh else t.min_count(ctl["round"])
+            st = ctl["make_state"]()
+            return {"fresh": fresh, "format": t.fmt, "count": t.count,
+                    "min_count": min_c, "auto_pause": tour["auto_pause"],
+                    "engines": [e["path"] for e in st["engines"]],
+                    "time": st["time"], "inc": st["inc"]}
+
+    def edit_tournament(ch: dict):
+        """Main thread: change rounds / matches and auto-pause of the running
+        tournament ({"count", "auto_pause"})."""
+        tour = state["tournament"]
+        ctl = tour and tour.get("ctl")
+        if not ctl:
+            return
+        tour["auto_pause"] = bool(ch.get("auto_pause", tour["auto_pause"]))
+        with ctl["lock"]:
+            t = ctl["tourney"]
+            if "count" in ch and int(ch["count"]) != t.count:
+                t.set_count(max(int(ch["count"]), t.min_count(ctl["round"])))
+        ctl["autosave"]()
+        gui._render_tournament(ctl["snap"]())
+
+    def restart_tournament(cfg: dict):
+        """Main thread: replace a tournament that has not played a game yet
+        with a new setup (cfg as for start_tournament)."""
+        tour = state["tournament"]
+        if not tour:
+            start_tournament(cfg)
+            return
+        tour["restart_cfg"] = cfg
+        tour["stop"].set()
+        gui.update(status="Restarting tournament…")
 
     def run_tournament(cfg: dict, tour: dict):
         """Tournament thread. The state (engines, time control, pairings and
@@ -3740,14 +3923,18 @@ Examples:
             tourney = Tournament([e.name for e in engines], cfg["format"], cfg["count"])
         fmt_name = "Round robin" if tourney.fmt == "rr" else "Swiss"
 
+        tour["auto_pause"] = auto_pause
+        lock = threading.RLock()   # guards tourney against edits from the GUI
+
         def make_state() -> dict:
-            return {"kind": "chess_player tournament",
-                    "version": _TOURNAMENT_STATE_VERSION,
-                    "saved": datetime.datetime.now().isoformat(timespec="seconds"),
-                    "engines": [{"name": e.name, "path": os.path.abspath(e.path)}
-                                for e in engines],
-                    "time": t_time, "inc": t_inc, "auto_pause": auto_pause,
-                    "tournament": tourney.to_dict()}
+            with lock:
+                return {"kind": "chess_player tournament",
+                        "version": _TOURNAMENT_STATE_VERSION,
+                        "saved": datetime.datetime.now().isoformat(timespec="seconds"),
+                        "engines": [{"name": e.name, "path": os.path.abspath(e.path)}
+                                    for e in engines],
+                        "time": t_time, "inc": t_inc, "auto_pause": tour["auto_pause"],
+                        "tournament": tourney.to_dict()}
 
         def autosave():
             try:
@@ -3755,8 +3942,17 @@ Examples:
             except OSError as e:
                 print(f"  Could not autosave tournament: {e}")
 
+        def snap(status: str = "running") -> dict:
+            with lock:
+                return tourney.snapshot(status, tc_text)
+
+        # For editing from the GUI while paused (see edit_tournament)
+        ctl = {"lock": lock, "tourney": tourney, "round": 0, "game_started": False,
+               "make_state": make_state, "autosave": autosave, "snap": snap}
+        tour["ctl"] = ctl
+
         autosave()
-        gui.update(tournament=tourney.snapshot("running", tc_text))
+        gui.update(tournament=snap())
 
         def wait_resume() -> bool:
             """Block while paused. False if the tournament was stopped."""
@@ -3767,12 +3963,16 @@ Examples:
                     return False
             return not stop.is_set()
 
-        for rnd in range(tourney.total_rounds):
-            if stop.is_set():
-                break
-            pairs, bye = tourney.pairings(rnd)
-            if bye is not None and tourney.fmt == "swiss" and not tourney.has_bye(rnd):
-                tourney.record_bye(rnd, bye)
+        rnd = 0
+        while not stop.is_set():
+            with lock:
+                # The number of rounds may change while paused
+                if rnd >= tourney.total_rounds:
+                    break
+                ctl["round"] = rnd
+                pairs, bye = tourney.pairings(rnd)
+                if bye is not None and tourney.fmt == "swiss" and not tourney.has_bye(rnd):
+                    tourney.record_bye(rnd, bye)
             autosave()   # fixes this round's pairings
             if tourney.fmt == "swiss":
                 # Play the bottom boards first, so the leaders meet last
@@ -3789,14 +3989,15 @@ Examples:
                     ready.set()
 
                 # Show the next pairing right away, also while paused
-                gui.update(call=_prep, tournament=tourney.snapshot("running", tc_text))
+                gui.update(call=_prep, tournament=snap())
                 ready.wait(timeout=5)
-                if auto_pause and gui._resume_event.is_set():
+                if tour["auto_pause"] and gui._resume_event.is_set():
                     gui._resume_event.clear()
                     gui.update(call=gui.show_paused)
                 if not wait_resume():
                     tourney.current = None
                     break
+                ctl["game_started"] = True
                 print(f"\n=== Tournament round {rnd + 1}, game {len(tourney.games) + 1}"
                       f"/{tourney.total_games}: {we.name} vs {be.name} ===")
                 game = Game(we, be, t_time, t_inc, gui, stop,
@@ -3819,22 +4020,24 @@ Examples:
                         gui.update(status=f"{crashed.name} could not be restarted: {e}")
                 if stop.is_set() or result == "*":
                     break
-                tourney.record(rnd, wi, bi, result, game.reason)
+                with lock:
+                    tourney.record(rnd, wi, bi, result, game.reason)
                 autosave()
-                gui.update(tournament=tourney.snapshot("running", tc_text))
+                gui.update(tournament=snap())
                 # Short pause so the final position and result can be seen
                 if stop.wait(timeout=2.5):
                     break
+            rnd += 1
 
         finished = not stop.is_set()
         for eng in engines:
             eng.quit()
-        snap = tourney.snapshot("finished" if finished else "stopped", tc_text)
+        final_snap = snap("finished" if finished else "stopped")
         if finished:
-            winners = [r["name"] for r in snap["rows"] if r["rank"] == 1]
+            winners = [r["name"] for r in final_snap["rows"] if r["rank"] == 1]
             msg = f"Tournament finished — winner: {', '.join(winners)}"
             print(f"\n{msg}")
-            for r in snap["rows"]:
+            for r in final_snap["rows"]:
                 print(f"  {r['rank']:>2}. {r['name']:<24} {r['points']:>5g} pts"
                       f"   SB {r['sb']:.2f}   (+{r['wins']} ={r['draws']} -{r['losses']})")
         else:
@@ -3845,8 +4048,12 @@ Examples:
 
             def _keep():   # so the dialog can offer to extend it
                 gui._finished_tournament = done_state
+                try:
+                    _write_json_atomic(_FINISHED_TOURNAMENT_FILE, done_state)
+                except OSError as e:
+                    print(f"  Could not save finished tournament: {e}")
             gui.update(call=_keep)
-        gui.update(call=lambda: finish_tournament(snap, msg, final_state=final))
+        gui.update(call=lambda: finish_tournament(final_snap, msg, final_state=final))
 
     def finish_tournament(snap: Optional[dict], msg: str,
                           final_state: Optional[dict] = None, ask: Optional[str] = None):
@@ -3857,6 +4064,11 @@ Examples:
         save = bool(tour and tour.get("save"))
         state["tournament"] = None
         gui.exit_tournament_mode()
+        if tour and tour.get("restart_cfg"):
+            # Set up again before the first game: start the new tournament
+            _remove_current_tournament()
+            start_tournament(tour["restart_cfg"])
+            return
         if snap:
             gui._render_tournament(snap)
         else:
@@ -3882,7 +4094,14 @@ Examples:
         else:
             gui.update(status=msg + " — click the player names to select engines")
 
-    gui.set_tournament_callbacks(start_tournament, stop_tournament)
+    gui.set_tournament_callbacks(start_tournament, stop_tournament,
+                                 tournament_info, edit_tournament, restart_tournament)
+    if os.path.exists(_FINISHED_TOURNAMENT_FILE):
+        try:
+            gui._finished_tournament = _load_tournament_file(
+                _FINISHED_TOURNAMENT_FILE, check_engines=False)
+        except ValueError as e:
+            print(f"Ignoring finished tournament: {e}")
 
     gui.set_settings_callbacks(lambda: state["tc"], apply_settings)
     gui.set_restart_callback(restart)

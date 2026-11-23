@@ -13,5 +13,6 @@ dist/
 .tournament_settings.json
 .current_tournament.json
 .current_tournament.json.invalid
+.finished_tournament.json
 games/
 tournaments/
