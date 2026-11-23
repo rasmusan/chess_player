@@ -30,7 +30,7 @@ import time
 from typing import Optional, Tuple
 
 # Single source of truth for the version. build.ps1 reads (and bumps) this line.
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -948,6 +948,8 @@ class ChessGUI:
         self._tournament_start_cb = None
         self._tournament_stop_cb  = None
         self._last_tournament_snap: Optional[dict] = None
+        # State of the last finished tournament, which can be extended
+        self._finished_tournament: Optional[dict] = None
         # Graph panel: which metrics to show, and the last data drawn
         sel = [m for m in _load_gui_settings().get("graph_metrics", ["eval"])
                if m in GRAPH_METRICS]
@@ -988,6 +990,8 @@ class ChessGUI:
         _save_gui_settings({"font_size": size})
         for (_, base, _), f in self._fonts.items():
             f.configure(size=max(6, round(base * self._scale)))
+        self._set_name_label(self._wn, self.white_name, True)
+        self._set_name_label(self._bn, self.black_name, False)
         self._update_min_size()
         self._layout()
         self._draw_graph()
@@ -1098,15 +1102,18 @@ class ChessGUI:
 
         grid = tk.Frame(win, bg=BG)
         grid.grid(row=1, column=0, columnspan=3, sticky="w")
+        grid.columnconfigure(0, minsize=self._font(10).measure("0" * 20))
         tk.Label(grid, text="", bg=BG).grid(row=0, column=0)
         tk.Label(grid, text="Time", font=self._font(9), fg=DIM, bg=BG
                  ).grid(row=0, column=1, sticky="e", padx=(10, 0))
         tk.Label(grid, text="Increment", font=self._font(9), fg=DIM, bg=BG
                  ).grid(row=0, column=2, sticky="e", padx=(10, 0))
 
-        def _row(r, label, t, inc):
+        def _row(r, label, t, inc, white=None):
             lbl = tk.Label(grid, text=label, font=self._font(10), fg=FG, bg=BG,
-                           anchor="w", width=20)
+                           anchor="w")
+            if white is not None:
+                self._set_name_label(lbl, label, white, self._font(10))
             te  = tk.Entry(grid, **ENTRY)
             ie  = tk.Entry(grid, **ENTRY)
             te.insert(0, fmt_duration(t))
@@ -1117,8 +1124,8 @@ class ChessGUI:
             return (lbl, te, ie)
 
         both_row  = _row(1, "Both engines", tc["white_time"], tc["white_inc"])
-        white_row = _row(2, f"♙ {self.white_name[:17]}", tc["white_time"], tc["white_inc"])
-        black_row = _row(3, f"♟ {self.black_name[:17]}", tc["black_time"], tc["black_inc"])
+        white_row = _row(2, self.white_name[:17], tc["white_time"], tc["white_inc"], True)
+        black_row = _row(3, self.black_name[:17], tc["black_time"], tc["black_inc"], False)
 
         sep_var = tk.BooleanVar(value=tc["separate"])
 
@@ -1153,10 +1160,6 @@ class ChessGUI:
                        selectcolor="#2e2e2e", activebackground=BG,
                        activeforeground="white", cursor="hand2"
                        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
-
-        tk.Label(win, text="Time: seconds or m:ss   Increment: seconds",
-                 font=self._font(8), fg="#666666", bg=BG
-                 ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         note = ("Changes apply from the next game." if self.game_in_progress
                 else "")
@@ -1435,22 +1438,22 @@ class ChessGUI:
         self._build_tournament_panel(content)
 
         # ── Player panels ──
-        def player_panel(parent, name, symbol):
+        def player_panel(parent):
             f  = tk.Frame(parent, bg=self.BG_IDLE, pady=8, padx=10)
             f.pack(fill="x")
-            nm = self._lbl(f, f"{symbol} {name}", self._font(13, "bold"))
+            nm = self._lbl(f, "", self._font(13, "bold"))
             nm.pack(side="left")
-            ev = self._lbl(f, "eval: ---", self._font(11), fg="#aaaaaa")
-            ev.pack(side="right", padx=14)
             tm = self._lbl(f, "--:--.-", self._font(16, "bold"), fg="#55aaff")
-            tm.pack(side="right")
-            return f, nm, tm, ev
+            tm.pack(side="right", padx=(0, 14))
+            return f, nm, tm
 
-        self._bf, self._bn, self._bt, self._be = player_panel(left, self.black_name, "♟")
+        self._bf, self._bn, self._bt = player_panel(left)
 
         self._canvas = tk.Canvas(left, width=px, height=px, highlightthickness=0,
                                  bg=self.BG_IDLE)
-        self._wf, self._wn, self._wt, self._we = player_panel(left, self.white_name, "♙")
+        self._wf, self._wn, self._wt = player_panel(left)
+        self._set_name_label(self._wn, self.white_name, True)
+        self._set_name_label(self._bn, self.black_name, False)
         # White's panel is packed before the canvas so it keeps its height
         self._wf.pack_configure(side="bottom")
         self._canvas.pack(fill="both", expand=True)
@@ -1923,11 +1926,11 @@ class ChessGUI:
     def _update_engine_name(self, color: chess.Color, name: str):
         if color == chess.WHITE:
             self.white_name = name
-            self._wn.config(text=f"♙ {name}")
+            self._set_name_label(self._wn, name, True)
             self._log_btn_w.config(text=f"☰  {name[:14]}")
         else:
             self.black_name = name
-            self._bn.config(text=f"♟ {name}")
+            self._set_name_label(self._bn, name, False)
             self._log_btn_b.config(text=f"☰  {name[:14]}")
 
     def _on_name_click(self, color: chess.Color):
@@ -2336,13 +2339,13 @@ class ChessGUI:
         self._update_min_size()
         self._layout()
 
-    def _pawn_marker(self, white: bool):
-        """Small pawn image for the standings, sized to the text: solid white
-        for White, black with a white outline for Black (so both read clearly
-        on the dark background). None without PIL / pieces.png."""
+    def _pawn_marker(self, white: bool, font=None):
+        """Small pawn image sized to the text of `font` (default: the standings
+        font): solid white for White, black with a white outline for Black (so
+        both read clearly on the dark background). None without PIL / pieces.png."""
         if not self._piece_src:
             return None
-        h = max(8, self._font(9).metrics("linespace") - 1)
+        h = max(8, (font or self._font(9)).metrics("linespace") - 1)
         key = (white, h)
         cache = self.__dict__.setdefault("_pawn_marks", {})
         if key in cache:
@@ -2366,6 +2369,15 @@ class ChessGUI:
             img = Image.alpha_composite(img, body)
         cache[key] = ImageTk.PhotoImage(img)
         return cache[key]
+
+    def _set_name_label(self, lbl, name: str, white: bool, font=None):
+        """Show `name` with a White/Black pawn image (glyph without PIL)."""
+        img = self._pawn_marker(white, font or self._font(13, "bold"))
+        if img:
+            lbl.config(text=f" {name}", image=img, compound="left")
+            lbl._pawn_img = img   # keep a reference
+        else:
+            lbl.config(text=f"{'♙' if white else '♟'} {name}", image="")
 
     # ── Tooltips for engine names shortened to fit a column ──
 
@@ -2552,7 +2564,9 @@ class ChessGUI:
             t.delete("1.0", "end")
             t.config(state="disabled")
 
-    def prepare_tournament_game(self, white_engine, black_engine):
+    def prepare_tournament_game(self, white_engine, black_engine,
+                                white_time: Optional[float] = None,
+                                black_time: Optional[float] = None):
         """Clear the board for the next tournament game. Main thread."""
         self.set_engines(white_engine, black_engine)
         self._update_engine_name(chess.WHITE, white_engine.name)
@@ -2564,13 +2578,14 @@ class ChessGUI:
         self._draw_graph({})
         self._last_move_lbl.config(text="")
         self._moves_lbl.config(text="")
-        for frame, nm, tm, ev in [
-            (self._wf, self._wn, self._wt, self._we),
-            (self._bf, self._bn, self._bt, self._be),
+        for frame, nm, tm, t in [
+            (self._wf, self._wn, self._wt, white_time),
+            (self._bf, self._bn, self._bt, black_time),
         ]:
-            for w in (frame, nm, tm, ev):
+            for w in (frame, nm, tm):
                 w.config(bg=self.BG_IDLE)
-            ev.config(text="eval: ---")
+            if t is not None:
+                tm.config(text=fmt_time(t))
         self._update_action_btn()
 
     def exit_tournament_mode(self):
@@ -2649,10 +2664,23 @@ class ChessGUI:
             lb.see(k)
             _update()
 
-        tk.Button(win, text="Add engine…", font=self._font(9), bg="#3a3a3a", fg="#aaaaaa",
-                  relief="flat", padx=10, pady=2, activebackground="#555555",
-                  activeforeground="white", cursor="hand2", command=_browse
-                  ).grid(row=3, column=0, columnspan=4, sticky="w")
+        def _select_all(on: bool):
+            if on:
+                lb.selection_set(0, "end")
+            else:
+                lb.selection_clear(0, "end")
+            _update()
+
+        SB = dict(font=self._font(9), bg="#3a3a3a", fg="#aaaaaa", relief="flat",
+                  padx=10, pady=2, activebackground="#555555",
+                  activeforeground="white", cursor="hand2")
+        ef = tk.Frame(win, bg=BG)
+        ef.grid(row=3, column=0, columnspan=4, sticky="w")
+        tk.Button(ef, text="Add engine…", command=_browse, **SB).pack(side="left")
+        tk.Button(ef, text="Add all", command=lambda: _select_all(True), **SB
+                  ).pack(side="left", padx=(8, 0))
+        tk.Button(ef, text="Remove all", command=lambda: _select_all(False), **SB
+                  ).pack(side="left", padx=(8, 0))
 
         # Format + count
         fmt_var = tk.StringVar(value=saved.get("format", "rr")
@@ -2708,16 +2736,58 @@ class ChessGUI:
         inc_e = tk.Entry(tf, **ENTRY)
         inc_e.insert(0, f"{float(saved.get('inc', tc['white_inc'])):g}")
         inc_e.pack(side="left")
-        tk.Label(win, text="Time: seconds or m:ss   Increment: seconds",
-                 font=self._font(8), fg="#666666", bg=BG
-                 ).grid(row=7, column=0, columnspan=4, sticky="w", pady=(4, 0))
+
+        CB = dict(font=self._font(10), fg=FG, bg=BG, selectcolor="#2e2e2e",
+                  activebackground=BG, activeforeground="white", cursor="hand2")
+        auto_var = tk.BooleanVar(value=bool(saved.get("auto_pause", False)))
+        tk.Checkbutton(win, text="Pause before each match", variable=auto_var, **CB
+                       ).grid(row=7, column=0, columnspan=4, sticky="w", pady=(8, 0))
+
+        # A finished tournament with the same engines and format can be
+        # extended with more rounds / matches instead of starting over
+        extend_var = tk.BooleanVar(value=True)
+        extend_cb = tk.Checkbutton(win, text="", variable=extend_var, **CB)
+        extend_cb.grid(row=8, column=0, columnspan=4, sticky="w", pady=(2, 0))
+        extend_cb.grid_remove()
+
+        def _norm(pth):
+            return os.path.normcase(os.path.abspath(pth))
+
+        def _extend_games() -> int:
+            """Number of extra games if the finished tournament can be
+            extended with the current choices, else 0."""
+            ft = self._finished_tournament
+            if not ft:
+                return 0
+            td = ft["tournament"]
+            try:
+                c = int(count_var.get())
+            except ValueError:
+                return 0
+            sel = sorted(_norm(items[k][1]) for k in lb.curselection())
+            if (fmt_var.get() != td["format"] or c <= int(td["count"]) or
+                    sel != sorted(_norm(e["path"]) for e in ft["engines"])):
+                return 0
+            try:
+                old = Tournament.from_dict(td)
+                new = Tournament.from_dict({**td, "count": c})
+            except (KeyError, TypeError, ValueError):
+                return 0
+            return new.total_games - old.total_games
 
         msg = tk.Label(win, text="", font=self._font(9), fg="#ff5533", bg=BG)
-        msg.grid(row=8, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        msg.grid(row=9, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
         def _update(*_):
             fmt = fmt_var.get()
             count_lbl.config(text="Rounds:" if fmt == "rr" else "Matches per engine:")
+            extra = _extend_games()
+            if extra:
+                extend_cb.config(text=f"Extend the finished tournament "
+                                      f"(+{extra} game{'s' if extra != 1 else ''})")
+                extend_cb.grid()
+            else:
+                extend_cb.grid_remove()
             n = len(lb.curselection())
             try:
                 c = max(1, int(count_var.get()))
@@ -2766,8 +2836,15 @@ class ChessGUI:
             _save_tournament_settings({
                 "engines": sel, "format": fmt,
                 "rr_rounds": counts["rr"], "swiss_matches": counts["swiss"],
-                "time": t, "inc": inc,
+                "time": t, "inc": inc, "auto_pause": auto_var.get(),
             })
+            if extend_var.get() and _extend_games():
+                ft = self._finished_tournament
+                st = {**ft, "tournament": {**ft["tournament"], "count": count},
+                      "time": t, "inc": inc, "auto_pause": auto_var.get()}
+                win.destroy()
+                self._tournament_start_cb({"resume": st})
+                return
             # Unique display names (two engines may share a file name)
             names, used = [], {}
             for pth in sel:
@@ -2775,7 +2852,8 @@ class ChessGUI:
                 used[base] = used.get(base, 0) + 1
                 names.append(base if used[base] == 1 else f"{base} #{used[base]}")
             cfg = {"engines": list(zip(names, sel)), "format": fmt,
-                   "count": count, "time": t, "inc": inc}
+                   "count": count, "time": t, "inc": inc,
+                   "auto_pause": auto_var.get()}
             win.destroy()
             self._tournament_start_cb(cfg)
 
@@ -2792,16 +2870,17 @@ class ChessGUI:
             except ValueError as e:
                 msg.config(text=str(e))
                 return
+            st["auto_pause"] = auto_var.get()
             win.destroy()
             self._tournament_start_cb({"resume": st})
 
         tk.Button(win, text="Continue from file…", font=self._font(9), bg="#3a3a3a",
                   fg="#ffcc44", relief="flat", padx=10, pady=4, activebackground="#555555",
                   activeforeground="#ffdd66", cursor="hand2", command=_continue
-                  ).grid(row=9, column=0, columnspan=2, sticky="w", pady=(12, 0))
+                  ).grid(row=10, column=0, columnspan=2, sticky="w", pady=(12, 0))
 
         bf = tk.Frame(win, bg=BG)
-        bf.grid(row=9, column=2, columnspan=2, sticky="e", pady=(12, 0))
+        bf.grid(row=10, column=2, columnspan=2, sticky="e", pady=(12, 0))
         tk.Button(bf, text="Start", font=self._font(9),
                   bg="#2a4a00", fg="#88ff44", relief="flat", padx=14, pady=4,
                   activebackground="#3a6a00", activeforeground="#aaff66",
@@ -2813,7 +2892,7 @@ class ChessGUI:
         if self.game_in_progress:
             tk.Label(win, text="Starting a tournament stops the current game.",
                      font=self._font(9), fg="#ffaa44", bg=BG
-                     ).grid(row=10, column=0, columnspan=4, sticky="w", pady=(8, 0))
+                     ).grid(row=11, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
         win.bind("<Escape>", lambda e: win.destroy())
         win.bind("<Return>", _start)
@@ -2867,6 +2946,11 @@ class ChessGUI:
                 self._wn.config(cursor="")
                 self._update_action_btn()
 
+    def show_paused(self):
+        """Show ▶ after the tournament paused itself. Main thread."""
+        if self._tournament_running and not self._resume_event.is_set():
+            self._play_btn.config(text="▶", fg="#88ff44")
+
     def _set_game_over_btn(self):
         if self._tournament_running:
             # The tournament moves on to the next game by itself; ▶/⏸ keeps
@@ -2905,14 +2989,13 @@ class ChessGUI:
         self._status.config(text="Restarting...")
         self._last_move_lbl.config(text="")
         self._moves_lbl.config(text="")
-        for frame, nm, tm, ev in [
-            (self._wf, self._wn, self._wt, self._we),
-            (self._bf, self._bn, self._bt, self._be),
+        for frame, nm, tm in [
+            (self._wf, self._wn, self._wt),
+            (self._bf, self._bn, self._bt),
         ]:
-            for w in (frame, nm, tm, ev):
+            for w in (frame, nm, tm):
                 w.config(bg=self.BG_IDLE)
             tm.config(text="--:--.-")
-            ev.config(text="eval: ---")
         self._update_action_btn()
 
     # ── Thread-safe update ──
@@ -2946,12 +3029,6 @@ class ChessGUI:
             self._wt.config(text=fmt_time(d["white_time"]))
         if "black_time" in d:
             self._bt.config(text=fmt_time(d["black_time"]))
-        if "white_eval" in d:
-            v = d["white_eval"]
-            self._we.config(text=f"eval: {v}" if v else "eval: ---")
-        if "black_eval" in d:
-            v = d["black_eval"]
-            self._be.config(text=f"eval: {v}" if v else "eval: ---")
         if "status" in d:
             self._status.config(text=d["status"])
         if "move" in d:
@@ -2968,12 +3045,12 @@ class ChessGUI:
             self.reset_play_button()
         if "active" in d:
             active = d["active"]
-            for frame, nm, tm, ev, color in [
-                (self._wf, self._wn, self._wt, self._we, chess.WHITE),
-                (self._bf, self._bn, self._bt, self._be, chess.BLACK),
+            for frame, nm, tm, color in [
+                (self._wf, self._wn, self._wt, chess.WHITE),
+                (self._bf, self._bn, self._bt, chess.BLACK),
             ]:
                 bg = self.BG_ACTV if active == color else self.BG_IDLE
-                for w in (frame, nm, tm, ev):
+                for w in (frame, nm, tm):
                     w.config(bg=bg)
         if "engine_changed" in d:
             self._update_engine_name(*d["engine_changed"])
@@ -3078,8 +3155,6 @@ class Game:
             board=chess.Board(),
             white_time=self.wtime,
             black_time=self.btime,
-            white_eval=None,
-            black_eval=None,
             status="Press ▶ to start" if waiting else f"WHITE: {w}   BLACK: {b}",
             move="",
             active=None,
@@ -3149,30 +3224,9 @@ class Game:
                 think_budget=my_t,
             )
 
-            def on_info(line, _turn=turn):
-                parts = line.split()
-                try:
-                    if "score" in parts:
-                        idx  = parts.index("score")
-                        kind = parts[idx + 1]
-                        val  = int(parts[idx + 2])
-                        if kind == "cp":
-                            s = f"{val / 100:+.2f}"
-                        elif kind == "mate":
-                            s = f"M{val}" if val > 0 else f"-M{abs(val)}"
-                        else:
-                            return
-                        if self.gui:
-                            if _turn == chess.WHITE:
-                                self.gui.update(white_eval=s)
-                            else:
-                                self.gui.update(black_eval=s)
-                except (IndexError, ValueError):
-                    pass
-
             move_uci, score = engine.get_move(
                 self.board, wms, bms, winc_ms, binc_ms,
-                hard_limit, info_callback=on_info, stop_event=self.stop_event,
+                hard_limit, stop_event=self.stop_event,
             )
 
             if self.stop_event.is_set():
@@ -3192,8 +3246,6 @@ class Game:
                 think_start=None,      # stop the live countdown
                 white_time=self.wtime,
                 black_time=self.btime,
-                white_eval=self.white_eval,
-                black_eval=self.black_eval,
             )
 
             # ── Flag ──
@@ -3610,6 +3662,7 @@ Examples:
             return
         tour = {"stop": threading.Event(), "engines": [], "thread": None, "save": False}
         state["tournament"] = tour
+        gui._finished_tournament = None
         state["stop"].set()          # stop any normal game
         gui.enter_tournament_mode(paused=True)
         t = threading.Thread(target=run_tournament, args=(cfg, tour), daemon=True)
@@ -3642,6 +3695,7 @@ Examples:
         else:
             eng_cfg = cfg["engines"]
             t_time, t_inc = cfg["time"], cfg["inc"]
+        auto_pause = bool((resume or cfg).get("auto_pause", False))
         tc_text = f"{fmt_duration(t_time)} + {t_inc:g}s"
 
         engines, failed = [], []
@@ -3692,7 +3746,7 @@ Examples:
                     "saved": datetime.datetime.now().isoformat(timespec="seconds"),
                     "engines": [{"name": e.name, "path": os.path.abspath(e.path)}
                                 for e in engines],
-                    "time": t_time, "inc": t_inc,
+                    "time": t_time, "inc": t_inc, "auto_pause": auto_pause,
                     "tournament": tourney.to_dict()}
 
         def autosave():
@@ -3720,21 +3774,29 @@ Examples:
             if bye is not None and tourney.fmt == "swiss" and not tourney.has_bye(rnd):
                 tourney.record_bye(rnd, bye)
             autosave()   # fixes this round's pairings
+            if tourney.fmt == "swiss":
+                # Play the bottom boards first, so the leaders meet last
+                pairs = pairs[::-1]
             for wi, bi in pairs:
                 if tourney.has_game(rnd, wi, bi):
                     continue   # played before the tournament was resumed
-                if not wait_resume():
-                    break
                 we, be = engines[wi], engines[bi]
                 tourney.current = (rnd, wi, bi)
                 ready = threading.Event()
 
                 def _prep(we=we, be=be, ready=ready):
-                    gui.prepare_tournament_game(we, be)
+                    gui.prepare_tournament_game(we, be, t_time, t_time)
                     ready.set()
 
+                # Show the next pairing right away, also while paused
                 gui.update(call=_prep, tournament=tourney.snapshot("running", tc_text))
                 ready.wait(timeout=5)
+                if auto_pause and gui._resume_event.is_set():
+                    gui._resume_event.clear()
+                    gui.update(call=gui.show_paused)
+                if not wait_resume():
+                    tourney.current = None
+                    break
                 print(f"\n=== Tournament round {rnd + 1}, game {len(tourney.games) + 1}"
                       f"/{tourney.total_games}: {we.name} vs {be.name} ===")
                 game = Game(we, be, t_time, t_inc, gui, stop,
@@ -3778,6 +3840,12 @@ Examples:
         else:
             msg = "Tournament stopped"
         final = None if finished else make_state()
+        if finished:
+            done_state = make_state()
+
+            def _keep():   # so the dialog can offer to extend it
+                gui._finished_tournament = done_state
+            gui.update(call=_keep)
         gui.update(call=lambda: finish_tournament(snap, msg, final_state=final))
 
     def finish_tournament(snap: Optional[dict], msg: str,

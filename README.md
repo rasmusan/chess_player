@@ -113,7 +113,7 @@ White (rubberduck5.1-duration) — 00:05.0 remaining
 Unless `--nogui` is passed, a small splash window shows progress while the engines start, then the main window opens showing:
 
 - **Chess board** with the last move highlighted
-- **Player panels** (top = Black, bottom = White) with engine name, clock, and live evaluation
+- **Player panels** (top = Black, bottom = White) with engine name (with a white or black pawn) and clock
 - The active player's panel is highlighted while they are thinking
 - A running move list along the bottom
 - A **graph panel** next to the board. Use the *Eval*, *Depth* and *Nodes* toggles at its top to choose what it shows. Selected graphs are stacked, each in its own box. The choice is remembered in `.gui_settings.json`.
@@ -131,14 +131,16 @@ Click **⚙** to set the time control and the **font size** (7–24, default 10)
 
 Click **♛ Tournament** to set up a tournament:
 
-- **Engines:** select 2 or more from the list. *Add engine…* adds one from disk.
+- **Engines:** select 2 or more from the list. *Add engine…* adds one from disk; *Add all* / *Remove all* select or clear the whole list.
 - **Format:**
   - *Round robin*: set the number of **rounds**. In each round every engine plays every other engine once. Colors are reversed in every second round.
-  - *Swiss*: set the number of **matches per engine**. Each round pairs engines with equal or similar scores that have not met yet, and balances colors. With an odd number of engines, one engine sits out each round and gets a bye worth 1 point.
+  - *Swiss*: set the number of **matches per engine**. Each round pairs engines with equal or similar scores that have not met yet, and balances colors. Within a round, the bottom boards are played first, so the leaders meet last. With an odd number of engines, one engine sits out each round and gets a bye worth 1 point.
 - **Time / increment:** the time control for all tournament games. It is separate from the ⚙ setting for normal games.
+- **Pause before each match:** the tournament pauses before every game, showing the next pairing; press ▶ to play it.
+- **Extend the finished tournament:** after a tournament has finished, open the dialog again with the same engines and format and raise the number of rounds / matches. This option then appears (on by default) and continues the finished tournament with the extra games, keeping its results.
 - **Continue from file…:** continue a tournament saved earlier (see below).
 
-While the tournament runs, a panel to the right of the graph shows the standings and the most recent results, newest first. The two engines in the current game are shown in green, with a white pawn ♙ or black pawn ♟ next to their names. A tournament always starts paused: press ▶ to play the first game (or the next game of a continued tournament). After that, games follow each other automatically. Engine names too long for the table or the results list are cut off with …; hover over them to see the full name. ▶/⏸ pauses and resumes the tournament, and ■ stops it.
+While the tournament runs, a panel to the right of the graph shows the standings and the most recent results, newest first. The two engines in the current game are shown in green, with a white pawn ♙ or black pawn ♟ next to their names. A tournament always starts paused, with the first pairing shown on the board: press ▶ to play the first game (or the next game of a continued tournament). After that, games follow each other automatically. Engine names too long for the table or the results list are cut off with …; hover over them to see the full name. ▶/⏸ pauses and resumes the tournament, and ■ stops it.
 
 **Saving and resuming:**
 
