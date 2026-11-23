@@ -1,6 +1,6 @@
 """Generate chess_player.ico (black knight on a light square) from pieces.png.
 
-Usage: python packaging/make_icon.py <pieces.png> <out.ico>
+Usage: python packaging/make_icon.py chess_player/assets/pieces.png chess_player/assets/chess_player.ico
 """
 import sys
 from PIL import Image, ImageDraw

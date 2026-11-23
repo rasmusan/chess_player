@@ -1,5 +1,5 @@
 ; Inno Setup script for Chess Player. Normally compiled by build.ps1, which
-; passes /DAppVersion=<version from chess_player.py>.
+; passes /DAppVersion=<version from chess_player/__init__.py>.
 
 #ifndef AppVersion
   #define AppVersion "0.0.0"
@@ -24,9 +24,10 @@ PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 OutputDir=..\dist\installer
 OutputBaseFilename=ChessPlayerSetup-{#AppVersion}
-SetupIconFile=chess_player.ico
+SetupIconFile=..\chess_player\assets\chess_player.ico
 UninstallDisplayIcon={app}\{#AppExe}
-Compression=lzma2
+; lzma2/fast: much faster to build than lzma2/max, for a slightly larger installer
+Compression=lzma2/fast
 SolidCompression=yes
 WizardStyle=modern
 ; Close a running Chess Player before upgrading
