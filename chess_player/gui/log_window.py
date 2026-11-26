@@ -21,6 +21,11 @@ class LogWindowMixin:
         tb.pack(fill="x")
         tk.Label(tb, text=engine.name, font=self._font(11, "bold"),
                  fg="#dddddd", bg="#1a1a1a").pack(side="left")
+        if not engine.running and not engine.log:
+            tk.Label(tb, text="not loaded yet — it starts with the game; reopen this "
+                              "window then to change its options",
+                     font=self._font(9), fg="#888888", bg="#1a1a1a"
+                     ).pack(side="left", padx=(12, 0))
         tk.Button(tb, text="Clear", font=self._font(9),
                   bg="#3a3a3a", fg="#aaaaaa", relief="flat", padx=8,
                   activebackground="#555", activeforeground="white",

@@ -29,8 +29,28 @@ class UCIEngine:
         self.last_nodes: Optional[int] = None   # from UCI 'info nodes', if reported
         self.log: list[tuple[str, str]] = []   # (">"|"<", line)
         self.options: dict = {}                # name → {type, default, min, max, var, value}
+        self._start_lock = threading.Lock()
+
+    @property
+    def running(self) -> bool:
+        return self.process is not None and self.process.poll() is None
+
+    def ensure_started(self):
+        """Start the engine process unless it is already running. Engines are
+        only started when a game needs them. Raises on failure."""
+        with self._start_lock:
+            if not self.running:
+                self.start()
 
     def start(self):
+        if self.process is not None:   # restarting after quit / a crash
+            try:
+                self.process.kill()
+            except Exception:
+                pass
+        old_options = self.options
+        self.options = {}
+        self._q = queue.Queue()
         abs_path = os.path.abspath(self.path)
         self.process = subprocess.Popen(
             [abs_path],
@@ -42,20 +62,36 @@ class UCIEngine:
             cwd=os.path.dirname(abs_path),
             creationflags=_POPEN_FLAGS,
         )
-        threading.Thread(target=self._reader, daemon=True).start()
+        threading.Thread(target=self._reader, args=(self.process, self._q),
+                         daemon=True).start()
+        uci_start = len(self.log)
         self._send("uci")
         if not self._wait("uciok", timeout=15):
+            self._kill()
             raise RuntimeError(f"{self.name}: did not respond to 'uci'")
-        self._parse_uci_options()
+        self._parse_uci_options(uci_start)
+        # Options the user changed before a restart are set again
+        for name, opt in old_options.items():
+            if (opt["type"] != "button" and opt["value"] is not None
+                    and opt["value"] != opt["default"] and name in self.options):
+                self.set_option(name, opt["value"])
+                self.options[name]["value"] = opt["value"]
         self._send("isready")
         if not self._wait("readyok", timeout=15):
+            self._kill()
             raise RuntimeError(f"{self.name}: did not respond to 'isready'")
 
-    def _reader(self):
-        for line in self.process.stdout:
+    def _kill(self):
+        try:
+            self.process.kill()
+        except Exception:
+            pass
+
+    def _reader(self, process, q):
+        for line in process.stdout:
             line = line.rstrip()
             self.log.append(("<", line))
-            self._q.put(line)
+            q.put(line)
 
     def _send(self, cmd: str):
         self.log.append((">", cmd))
@@ -160,8 +196,8 @@ class UCIEngine:
         except (IndexError, ValueError):
             pass
 
-    def _parse_uci_options(self):
-        for direction, line in self.log:
+    def _parse_uci_options(self, start: int = 0):
+        for direction, line in self.log[start:]:
             if direction == "<" and line.startswith("option "):
                 self._parse_option_line(line)
 
@@ -201,6 +237,8 @@ class UCIEngine:
         self._send(f"setoption name {name} value {value}")
 
     def quit(self):
+        if not self.running:
+            return
         try:
             self._send("quit")
             self.process.wait(timeout=3)

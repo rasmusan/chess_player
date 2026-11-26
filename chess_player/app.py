@@ -40,39 +40,17 @@ def run_gui(args):
         "tournament": None,   # {"stop", "engines", "thread"} while one runs
     }
 
-    def _start_engine(path, required: bool):
-        """Start an engine. Engines from the command line are required (exit on
-        failure); engines restored from last session are skipped if they fail."""
-        name = os.path.splitext(os.path.basename(path))[0]
-        eng = UCIEngine(path, name)
-        print(f"Starting {name}...")
-        try:
-            eng.start()
-            print(f"  {name}: OK")
-        except Exception as e:
-            if required:
-                sys.exit(f"Engine startup failed: {e}")
-            print(f"  {name}: failed to start ({e}) — not restored")
-            try:
-                eng.quit()
-            except Exception:
-                pass
-            return None
-        return eng
-
     # Command-line engines take precedence; otherwise restore last session's.
-    # This can take a while, so a splash window shows that the app is starting.
+    # Engines are not started here: a game starts its engines when ▶ is pressed.
+    last = load_last_engines()
+    for key, cli_path in (("white", args.white_engine), ("black", args.black_engine)):
+        path = cli_path or (last.get(key) if last.get(key) and os.path.isfile(last[key]) else None)
+        if path:
+            state[key] = UCIEngine(path, os.path.splitext(os.path.basename(path))[0])
+
     splash = SplashWindow.create()
 
     def _startup():
-        last = load_last_engines()
-        for key, cli_path in (("white", args.white_engine), ("black", args.black_engine)):
-            path = cli_path or (last.get(key) if last.get(key) and os.path.isfile(last[key]) else None)
-            if not path:
-                continue
-            if splash:
-                splash.status = f"Starting {os.path.splitext(os.path.basename(path))[0]}…"
-            state[key] = _start_engine(path, required=bool(cli_path))
         if splash:
             splash.status = "Loading…"
         try:   # preload the graphics libraries the main window needs
@@ -99,6 +77,8 @@ def run_gui(args):
         save_last_engines(state["white"], state["black"])
 
     def start_game():
+        if state["white"] is None or state["black"] is None:
+            return   # an engine is still loading or not selected
         state["game_launched"] = True
         stop = threading.Event()
         state["stop"] = stop
@@ -112,10 +92,25 @@ def run_gui(args):
             state["result"], state["pgn"] = game.run()
             if game.crashed_engine is not None:
                 replace_crashed_engine(game.crashed_engine)
+            if game.failed_engine is not None:
+                gui.update(call=lambda: drop_failed_engine(game.failed_engine, game.start_error))
 
         t = threading.Thread(target=run, daemon=True)
         state["thread"] = t
         t.start()
+
+    def drop_failed_engine(eng: UCIEngine, error: str):
+        """Main thread: an engine failed to start when the game began. Clear
+        its seat so it is not shown as playing."""
+        if state["tournament"] is not None:
+            return
+        for key, color in (("white", chess.WHITE), ("black", chess.BLACK)):
+            if state[key] is eng:
+                state[key] = None
+                gui._update_engine_name(color, "—")
+        gui.set_engines(state["white"], state["black"])
+        gui._apply({"play_btn_enabled": False})
+        gui.update(status=f"{eng.name} failed to start: {error} — click the name to pick an engine")
 
     def replace_crashed_engine(old: UCIEngine):
         """Game thread: restart an engine that stopped responding."""
@@ -148,40 +143,58 @@ def run_gui(args):
         gui.root.after(300, start_game)
 
     def change_engine(color: chess.Color, new_path: str):
+        """Main thread. The engine is loaded right away; until it has loaded,
+        nobody is shown in its seat and ▶ is disabled, and the game that was
+        set up (with the old engine) is discarded."""
         name = os.path.splitext(os.path.basename(new_path))[0]
+        key = "white" if color == chess.WHITE else "black"
+        token = object()   # a newer pick for the same seat wins
+        state[f"loading_{key}"] = token
+        old = state[key]
+        state[key] = None
+        state["stop"].set()   # the waiting game still has the old engine
+        gui.set_engines(state["white"], state["black"])
+        gui.reset()
+        gui.reset_play_button()
+        gui._apply({"play_btn_enabled": False})
+        gui._update_engine_name(color, "—")
         gui.update(status=f"Starting {name}…")
 
         def _do_start():
+            if old:
+                old.quit()
             new_eng = UCIEngine(new_path, name)
             try:
                 new_eng.start()
-            except RuntimeError as e:
-                gui.update(status=f"Engine failed to start: {e}")
+                err = None
+            except Exception as e:
+                err = e
+            gui.update(call=lambda: _loaded(new_eng, err))
+
+        def _loaded(new_eng: UCIEngine, err):
+            if state.get(f"loading_{key}") is not token:
+                new_eng.quit()   # replaced by a newer pick meanwhile
+                return
+            state[f"loading_{key}"] = None
+            if err is not None:
+                new_eng.quit()
+                gui.update(status=f"{name} failed to start: {err}")
                 return
             save_engine_history(new_path)
-            if color == chess.WHITE:
-                old = state["white"]
-                state["white"] = new_eng
-            else:
-                old = state["black"]
-                state["black"] = new_eng
-            if old:
-                old.quit()
-            gui.set_engines(state["white"], state["black"])
+            state[key] = new_eng
             save_last_engines(state["white"], state["black"])
-
-            both_ready = state["white"] is not None and state["black"] is not None
-            if both_ready and not state["game_launched"]:
-                # Both engines now selected for the first time — enable ▶ and launch
-                gui.update(engine_changed=(color, name), play_btn_enabled=True, call=start_game)
-            else:
-                if state["white"] is None:
-                    hint = f"{name} ready — click ♙ White name to select its engine"
-                elif state["black"] is None:
-                    hint = f"{name} ready — click ♟ Black name to select its engine"
-                else:
-                    hint = f"{name} ready"
-                gui.update(engine_changed=(color, name), status=hint)
+            if state["tournament"] is not None:
+                return   # shown when the tournament ends (finish_tournament)
+            gui.set_engines(state["white"], state["black"])
+            gui._update_engine_name(color, name)
+            if state["white"] is None:
+                gui.update(status=f"{name} ready — click ♙ White name to select its engine")
+            elif state["black"] is None:
+                gui.update(status=f"{name} ready — click ♟ Black name to select its engine")
+            elif state["tournament"] is None:
+                gui._apply({"play_btn_enabled": True})
+                start_game()   # waits for ▶
+                gui.root.after(200, lambda: gui.update(status=f"{name} ready — press ▶ to start"))
 
         threading.Thread(target=_do_start, daemon=True).start()
 
@@ -250,7 +263,7 @@ def run_gui(args):
             return {"fresh": fresh, "format": t.fmt, "count": t.count,
                     "min_count": min_c, "auto_pause": tour["auto_pause"],
                     "engines": [e["path"] for e in st["engines"]],
-                    "time": st["time"], "inc": st["inc"]}
+                    "time": st["time"], "inc": st["inc"], "load_two": st["load_two"]}
 
     def edit_tournament(ch: dict):
         """Main thread: change rounds / matches and auto-pause of the running
@@ -298,16 +311,24 @@ def run_gui(args):
             eng_cfg = cfg["engines"]
             t_time, t_inc = cfg["time"], cfg["inc"]
         auto_pause = bool((resume or cfg).get("auto_pause", False))
+        # Load only the two engines of the current game (saves memory);
+        # otherwise all engines are loaded up front
+        load_two = bool((resume or cfg).get("load_two", False))
+        tour["load_two"] = load_two
         tc_text = f"{fmt_duration(t_time)} + {t_inc:g}s"
 
         engines, failed = [], []
         for name, path in eng_cfg:
             if stop.is_set():
                 break
-            gui.update(status=f"Tournament: starting {name}…")
             eng = UCIEngine(path, name)
             try:
-                eng.start()
+                if load_two:
+                    if not os.path.isfile(path):
+                        raise RuntimeError(f"file not found: {path}")
+                else:
+                    gui.update(status=f"Tournament: starting {name}…")
+                    eng.start()
                 engines.append(eng)
                 tour["engines"].append(eng)
                 save_engine_history(path)
@@ -315,10 +336,7 @@ def run_gui(args):
                 print(f"  {name}: failed to start ({e}) — left out of the tournament")
                 gui.update(status=f"{name} failed to start — left out")
                 failed.append(name)
-                try:
-                    eng.quit()
-                except Exception:
-                    pass
+                eng.quit()
                 if resume:
                     break   # a resumed tournament needs all of its engines
 
@@ -353,6 +371,7 @@ def run_gui(args):
                         "engines": [{"name": e.name, "path": os.path.abspath(e.path)}
                                     for e in engines],
                         "time": t_time, "inc": t_inc, "auto_pause": tour["auto_pause"],
+                        "load_two": load_two,
                         "tournament": tourney.to_dict()}
 
         def autosave():
@@ -400,6 +419,12 @@ def run_gui(args):
                 if tourney.has_game(rnd, wi, bi):
                     continue   # played before the tournament was resumed
                 we, be = engines[wi], engines[bi]
+                if load_two:
+                    # Unload the engines that don't play this game; the
+                    # game loads its two when it starts
+                    for eng in engines:
+                        if eng is not we and eng is not be:
+                            eng.quit()
                 tourney.current = (rnd, wi, bi)
                 ready = threading.Event()
 
@@ -424,6 +449,12 @@ def run_gui(args):
                             event=f"{fmt_name} tournament", round_=str(rnd + 1))
                 result, _pgn = game.run()
                 tourney.current = None
+                if game.failed_engine is not None and not stop.is_set():
+                    # Could not be loaded for this game: it loses by forfeit
+                    result = "0-1" if game.failed_engine is we else "1-0"
+                    game.reason = "failed to start"
+                    gui.update(status=f"{game.failed_engine.name} failed to start — "
+                                      f"loses the game by forfeit")
                 crashed = game.crashed_engine
                 if crashed is not None and not stop.is_set():
                     # Restart it so it can play its remaining games

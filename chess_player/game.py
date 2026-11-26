@@ -99,6 +99,9 @@ class Game:
         # Engine that probably crashed or hung (see is_unresponsive); the
         # caller restarts it after the game
         self.crashed_engine: Optional[UCIEngine] = None
+        # Engine that could not be started; the game was not played
+        self.failed_engine: Optional[UCIEngine] = None
+        self.start_error: str = ""
 
     def _gui(self, **kw):
         if self.gui:
@@ -116,11 +119,56 @@ class Game:
             lists[1 - side].append(None)
         self._gui(graph_history={m: (list(w), list(b)) for m, (w, b) in self._hist.items()})
 
+    def _start_engines(self) -> bool:
+        """Start engines that are not running yet (engines are only loaded
+        when a game starts). False if one failed or the game was stopped."""
+        for eng in (self.white, self.black):
+            if self.stop_event.is_set():
+                return False
+            if eng.running:
+                continue
+            self._gui(status=f"Starting {eng.name}…")
+            print(f"Starting {eng.name}...")
+            try:
+                eng.ensure_started()
+                print(f"  {eng.name}: OK")
+            except Exception as e:
+                print(f"  {eng.name}: failed to start ({e})")
+                self.failed_engine = eng
+                self.start_error = str(e)
+                return False
+        return not self.stop_event.is_set()
+
+    def _wait_for_play(self) -> bool:
+        """Block while waiting for ▶. False if the game was stopped."""
+        if self.resume_event is not None:
+            while not self.resume_event.wait(timeout=0.1):
+                if self.stop_event.is_set():
+                    return False
+        return not self.stop_event.is_set()
+
     def run(self) -> Tuple[str, chess.pgn.Game]:
+        w, b = self.white.name, self.black.name
+        waiting = self.resume_event is not None and not self.resume_event.is_set()
+        self._gui(
+            board=chess.Board(),
+            white_time=self.wtime,
+            black_time=self.btime,
+            status="Press ▶ to start" if waiting else f"WHITE: {w}   BLACK: {b}",
+            move="",
+            active=None,
+        )
+        if not self._wait_for_play() or not self._start_engines():
+            if self.failed_engine is not None:
+                self._gui(status=f"{self.failed_engine.name} failed to start: {self.start_error}",
+                          game_over=True)
+            return "*", chess.pgn.Game()
+        if waiting:
+            self._gui(status=f"WHITE: {w}   BLACK: {b}")
+
         self.white.new_game()
         self.black.new_game()
 
-        w, b = self.white.name, self.black.name
         sep  = "-" * 62
         print(f"\n{sep}")
         print(f"  WHITE: {w}")
@@ -133,16 +181,6 @@ class Game:
         print(sep + "\n")
         print(board_ascii(self.board))
         print()
-
-        waiting = self.resume_event is not None and not self.resume_event.is_set()
-        self._gui(
-            board=chess.Board(),
-            white_time=self.wtime,
-            black_time=self.btime,
-            status="Press ▶ to start" if waiting else f"WHITE: {w}   BLACK: {b}",
-            move="",
-            active=None,
-        )
 
         pgn_game = chess.pgn.Game()
         now = datetime.datetime.now()

@@ -38,7 +38,8 @@ class TournamentDialogMixin:
             cnt_key = "rr_rounds" if restart["format"] == "rr" else "swiss_matches"
             saved = {**saved, "engines": restart["engines"], "format": restart["format"],
                      cnt_key: restart["count"], "time": restart["time"],
-                     "inc": restart["inc"], "auto_pause": restart["auto_pause"]}
+                     "inc": restart["inc"], "auto_pause": restart["auto_pause"],
+                     "load_two": restart["load_two"]}
         tc = self._settings_get_cb() if self._settings_get_cb else default_time_control()
 
         items = [(disp, path) for disp, path, _ in engine_candidates()]
@@ -173,12 +174,16 @@ class TournamentDialogMixin:
         auto_var = tk.BooleanVar(value=bool(saved.get("auto_pause", False)))
         tk.Checkbutton(win, text="Pause before each match", variable=auto_var, **CB
                        ).grid(row=7, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        load_two_var = tk.BooleanVar(value=bool(saved.get("load_two", False)))
+        tk.Checkbutton(win, text="Load only two engines at a time (saves memory)",
+                       variable=load_two_var, **CB
+                       ).grid(row=8, column=0, columnspan=4, sticky="w", pady=(2, 0))
 
         # A finished tournament with the same engines and format can be
         # extended with more rounds / matches instead of starting over
         extend_var = tk.BooleanVar(value=True)
         extend_cb = tk.Checkbutton(win, text="", variable=extend_var, **CB)
-        extend_cb.grid(row=8, column=0, columnspan=4, sticky="w", pady=(2, 0))
+        extend_cb.grid(row=9, column=0, columnspan=4, sticky="w", pady=(2, 0))
         extend_cb.grid_remove()
 
         def _norm(pth):
@@ -207,7 +212,7 @@ class TournamentDialogMixin:
             return new.total_games - old.total_games
 
         msg = tk.Label(win, text="", font=self._font(9), fg="#ff5533", bg=BG)
-        msg.grid(row=9, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        msg.grid(row=10, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
         def _update(*_):
             fmt = fmt_var.get()
@@ -268,11 +273,13 @@ class TournamentDialogMixin:
                 "engines": sel, "format": fmt,
                 "rr_rounds": counts["rr"], "swiss_matches": counts["swiss"],
                 "time": t, "inc": inc, "auto_pause": auto_var.get(),
+                "load_two": load_two_var.get(),
             })
             if extend_var.get() and _extend_games():
                 ft = self._finished_tournament
                 st = {**ft, "tournament": {**ft["tournament"], "count": count},
-                      "time": t, "inc": inc, "auto_pause": auto_var.get()}
+                      "time": t, "inc": inc, "auto_pause": auto_var.get(),
+                      "load_two": load_two_var.get()}
                 win.destroy()
                 start_cb({"resume": st})
                 return
@@ -284,7 +291,7 @@ class TournamentDialogMixin:
                 names.append(base if used[base] == 1 else f"{base} #{used[base]}")
             cfg = {"engines": list(zip(names, sel)), "format": fmt,
                    "count": count, "time": t, "inc": inc,
-                   "auto_pause": auto_var.get()}
+                   "auto_pause": auto_var.get(), "load_two": load_two_var.get()}
             win.destroy()
             start_cb(cfg)
 
@@ -302,16 +309,17 @@ class TournamentDialogMixin:
                 msg.config(text=str(e))
                 return
             st["auto_pause"] = auto_var.get()
+            st["load_two"] = load_two_var.get()
             win.destroy()
             start_cb({"resume": st})
 
         tk.Button(win, text="Continue from file…", font=self._font(9), bg="#3a3a3a",
                   fg="#ffcc44", relief="flat", padx=10, pady=4, activebackground="#555555",
                   activeforeground="#ffdd66", cursor="hand2", command=_continue
-                  ).grid(row=10, column=0, columnspan=2, sticky="w", pady=(12, 0))
+                  ).grid(row=11, column=0, columnspan=2, sticky="w", pady=(12, 0))
 
         bf = tk.Frame(win, bg=BG)
-        bf.grid(row=10, column=2, columnspan=2, sticky="e", pady=(12, 0))
+        bf.grid(row=11, column=2, columnspan=2, sticky="e", pady=(12, 0))
         tk.Button(bf, text="Start", font=self._font(9),
                   bg="#2a4a00", fg="#88ff44", relief="flat", padx=14, pady=4,
                   activebackground="#3a6a00", activeforeground="#aaff66",
@@ -323,11 +331,11 @@ class TournamentDialogMixin:
         if restart:
             tk.Label(win, text="Start restarts the paused tournament with this setup.",
                      font=self._font(9), fg="#ffaa44", bg=BG
-                     ).grid(row=11, column=0, columnspan=4, sticky="w", pady=(8, 0))
+                     ).grid(row=12, column=0, columnspan=4, sticky="w", pady=(8, 0))
         elif self.game_in_progress:
             tk.Label(win, text="Starting a tournament stops the current game.",
                      font=self._font(9), fg="#ffaa44", bg=BG
-                     ).grid(row=11, column=0, columnspan=4, sticky="w", pady=(8, 0))
+                     ).grid(row=12, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
         win.bind("<Escape>", lambda e: win.destroy())
         win.bind("<Return>", _start)
