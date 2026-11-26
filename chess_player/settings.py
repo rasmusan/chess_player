@@ -130,6 +130,8 @@ def write_json_atomic(path: str, d: dict):
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(d, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())   # on disk before it replaces the old file
     os.replace(tmp, path)
 
 

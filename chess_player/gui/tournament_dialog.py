@@ -310,6 +310,7 @@ class TournamentDialogMixin:
                 return
             st["auto_pause"] = auto_var.get()
             st["load_two"] = load_two_var.get()
+            st["autosave"] = path   # keep this file up to date
             win.destroy()
             start_cb({"resume": st})
 

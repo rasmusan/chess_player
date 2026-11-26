@@ -68,7 +68,7 @@ While the tournament is paused, **♛ Tournament** still works. Before the first
 
 A finished tournament can be extended: open the dialog with the same engines and format, raise the rounds / matches, and keep *Extend the finished tournament* checked.
 
-The running tournament is saved after every game. If the app is closed, it resumes on the next start. **■ → Stop and save…** saves it to a file, which you can continue later with **Continue from file…**.
+The running tournament is saved after every game. If the app is closed or crashes, it resumes on the next start from the last completed game. It is also kept up to date in `tournamentsutosave_<date>-<time>.json`, which is never deleted, so you can always continue it with **Continue from file…**. **■ → Stop and save…** saves it to a file of your choice.
 
 ## Where files are kept
 

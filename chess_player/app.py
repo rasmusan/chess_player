@@ -12,7 +12,7 @@ from .game import Game, print_summary
 from .gui.splash import SplashWindow
 from .gui.window import ChessGUI
 from .settings import default_time_control, load_last_engines, load_time_settings, save_engine_history, save_last_engines, save_time_settings, write_json_atomic
-from .tournament import Tournament, CURRENT_TOURNAMENT_FILE, FINISHED_TOURNAMENT_FILE, TOURNAMENT_STATE_VERSION, load_tournament_file, remove_current_tournament
+from .tournament import Tournament, new_autosave_path, CURRENT_TOURNAMENT_FILE, FINISHED_TOURNAMENT_FILE, TOURNAMENT_STATE_VERSION, load_tournament_file, remove_current_tournament
 
 
 def run_gui(args):
@@ -316,6 +316,10 @@ def run_gui(args):
         load_two = bool((resume or cfg).get("load_two", False))
         tour["load_two"] = load_two
         tc_text = f"{fmt_duration(t_time)} + {t_inc:g}s"
+        # Kept up to date after every game, and never removed: the tournament
+        # can always be continued from it (Continue from file…), also after a
+        # crash. A resumed tournament keeps writing to its file.
+        autosave_path = (resume or {}).get("autosave") or new_autosave_path()
 
         engines, failed = [], []
         for name, path in eng_cfg:
@@ -371,14 +375,22 @@ def run_gui(args):
                         "engines": [{"name": e.name, "path": os.path.abspath(e.path)}
                                     for e in engines],
                         "time": t_time, "inc": t_inc, "auto_pause": tour["auto_pause"],
-                        "load_two": load_two,
+                        "load_two": load_two, "autosave": autosave_path,
                         "tournament": tourney.to_dict()}
 
         def autosave():
+            st = make_state()
             try:
-                write_json_atomic(CURRENT_TOURNAMENT_FILE, make_state())
+                write_json_atomic(CURRENT_TOURNAMENT_FILE, st)
             except OSError as e:
                 print(f"  Could not autosave tournament: {e}")
+            if not (tourney.games or resume):
+                return   # nothing to continue from yet
+            try:
+                os.makedirs(os.path.dirname(autosave_path), exist_ok=True)
+                write_json_atomic(autosave_path, st)
+            except OSError as e:
+                print(f"  Could not autosave tournament to {autosave_path}: {e}")
 
         def snap(status: str = "running") -> dict:
             with lock:
@@ -390,6 +402,7 @@ def run_gui(args):
         tour["ctl"] = ctl
 
         autosave()
+        print(f"Tournament is autosaved after every game to {autosave_path}")
         gui.update(tournament=snap())
 
         def wait_resume() -> bool:

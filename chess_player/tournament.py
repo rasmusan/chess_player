@@ -1,5 +1,6 @@
 """Tournament logic (pairings, standings) and tournament state files."""
 
+import datetime
 import json
 import os
 from typing import Optional, Tuple
@@ -16,6 +17,18 @@ CURRENT_TOURNAMENT_FILE = os.path.join(DATA_DIR, ".current_tournament.json")
 FINISHED_TOURNAMENT_FILE = os.path.join(DATA_DIR, ".finished_tournament.json")
 TOURNAMENTS_DIR          = os.path.join(DATA_DIR, "tournaments")
 TOURNAMENT_STATE_VERSION = 1
+
+def new_autosave_path() -> str:
+    """A new file in TOURNAMENTS_DIR that a tournament keeps up to date after
+    every game. Unlike CURRENT_TOURNAMENT_FILE it is never removed, so it can
+    always be continued with "Continue from file…"."""
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(TOURNAMENTS_DIR, f"autosave_{stamp}.json")
+    k = 2
+    while os.path.exists(path):
+        path = os.path.join(TOURNAMENTS_DIR, f"autosave_{stamp}_{k}.json")
+        k += 1
+    return path
 
 def check_tournament_state(d) -> dict:
     """Validate a tournament state dict (see run_tournament). Raises ValueError."""
