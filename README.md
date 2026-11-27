@@ -46,7 +46,7 @@ python -m chess_player
 
 **Engines.** Click a player's name above or below the board to pick its engine. Engines are not included with the app. Any UCI engine `.exe` works. Recently used engines are offered again, and the last White and Black engines are loaded on the next start.
 
-**Playing.** ▶ starts or pauses the game and ■ stops it. When no game is running, that button becomes ⇆ and swaps colors. The panel of the side to move is highlighted. **☰** opens an engine's log window, with its UCI traffic and options.
+**Playing.** ▶ starts or pauses the game and ■ stops it. When no game is running, that button becomes ⇆ and swaps colors. The panel of the side to move is highlighted, and next to each clock are the opponent's pieces that player is up (the net difference per piece type). **☰** opens an engine's log window, with its UCI traffic and options.
 
 **Graphs.** The panel next to the board shows *Eval*, *Depth* and/or *Nodes* per move. Toggle them at the top of the panel.
 
@@ -64,11 +64,11 @@ Click **♛ Tournament**:
 
 A tournament starts paused with the first pairing on the board. Press ▶ to play. The panel on the right shows the standings (points, then Sonneborn-Berger) and the results.
 
-While the tournament is paused, **♛ Tournament** still works. Before the first game you can change everything, including the engines. After that you can change the number of rounds / matches and the auto-pause.
+While the tournament is paused, **♛ Tournament** still works. Before the first game you can change everything, including the engines. After that you can only change the number of rounds / matches and the auto-pause (**Apply**). **Stop** ends the tournament.
 
-A finished tournament can be extended: open the dialog with the same engines and format, raise the rounds / matches, and keep *Extend the finished tournament* checked.
+When all games are played, the last game stays on the board with its graphs and the engines stay loaded, and ■ becomes **✓**. To extend the tournament, raise the rounds / matches in **♛ Tournament** and press **Apply**. **✓** (or **Stop** in the dialog) ends it, after asking whether to save it to a file. The engines can be changed again after that. An ended tournament can still be extended later: open the dialog with the same engines and format, raise the rounds / matches, and keep *Extend the finished tournament* checked.
 
-The running tournament is saved after every game. If the app is closed or crashes, it resumes on the next start from the last completed game. It is also kept up to date in `tournamentsutosave_<date>-<time>.json`, which is never deleted, so you can always continue it with **Continue from file…**. **■ → Stop and save…** saves it to a file of your choice.
+The running tournament is saved after every game. If the app is closed or crashes, it resumes on the next start from the last completed game. It is also kept up to date in `tournamentsutosave_<date>-<time>.json`, which is never deleted, so you can always continue it with **Continue from file…**. Stopping it with **■** asks whether to save it to a file of your choice.
 
 ## Where files are kept
 

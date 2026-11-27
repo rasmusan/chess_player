@@ -81,6 +81,8 @@ class ChessGUI(SettingsDialogMixin, BoardMixin, GraphMixin, EnginePickerMixin,
         self._engines_ready = engines_ready
         # Tournament mode
         self._tournament_running  = False
+        # All games played; waits for ✓ (end) or an extension
+        self._tournament_done     = False
         self._tournament_start_cb = None
         self._tournament_stop_cb  = None
         self._tournament_info_cb = self._tournament_edit_cb = None
@@ -225,21 +227,16 @@ class ChessGUI(SettingsDialogMixin, BoardMixin, GraphMixin, EnginePickerMixin,
     # ── Action button (Stop / Swap-colors) ──
 
     def _update_action_btn(self):
-        if self._tournament_running or (self._game_started and not self._game_over):
+        if self._tournament_running and self._tournament_done:
+            self._action_btn.config(text="✓", fg="#88ff44", activeforeground="#aaff66")
+        elif self._tournament_running or (self._game_started and not self._game_over):
             self._action_btn.config(text="■", fg="#ff4444", activeforeground="#ff6666")
         else:
             self._action_btn.config(text="⇆", fg="#aaaaaa", activeforeground="#cccccc")
 
     def _on_action_btn(self):
         if self._tournament_running:
-            if self._resume_event.is_set():
-                self._resume_event.clear()
-                self._play_btn.config(text="▶", fg="#88ff44")
-            stop = self._tournament_stop_cb or (lambda save: None)
-            self._open_stop_confirm(
-                "Stop the tournament?\nSave it to a file to continue it later.",
-                "Stop", lambda: stop(False), title="Stop tournament",
-                alt=("Stop and save…", lambda: stop(True)))
+            self._confirm_end_tournament()
             return
         if self._game_started and not self._game_over:
             if self._resume_event.is_set():
@@ -249,6 +246,24 @@ class ChessGUI(SettingsDialogMixin, BoardMixin, GraphMixin, EnginePickerMixin,
         else:
             if self._swap_cb:
                 self._swap_cb()
+
+    def _confirm_end_tournament(self):
+        """✓ / ■ / Stop in the Tournament dialog: end the tournament after
+        asking whether to save it to a file (Save… / Don't save / Cancel)."""
+        if not self._tournament_running:
+            return
+        if self._resume_event.is_set():
+            self._resume_event.clear()
+            self._play_btn.config(text="▶", fg="#88ff44")
+            self._update_tourn_btn()
+        stop = self._tournament_stop_cb or (lambda save: None)
+        if self._tournament_done:
+            text = "The tournament is finished.\nSave it to a file?"
+        else:
+            text = "Stop the tournament?\nSave it to a file to continue it later."
+        self._open_stop_confirm(text, "Don't save", lambda: stop(False),
+                                title="End tournament",
+                                alt=("Save…", lambda: stop(True)))
 
     def _open_stop_confirm(self, text="Stop and reset the current game?",
                            yes_text="Reset", on_yes=None, title="Stop game", alt=None):
@@ -341,13 +356,16 @@ class ChessGUI(SettingsDialogMixin, BoardMixin, GraphMixin, EnginePickerMixin,
             nm.pack(side="left")
             tm = self._lbl(f, "--:--.-", self._font(16, "bold"), fg="#55aaff")
             tm.pack(side="right", padx=(0, 14))
-            return f, nm, tm
+            # Net material captured from the opponent, left of the clock
+            cp = self._lbl(f, "", self._font(12, family="Segoe UI Symbol"), fg="#bbbbbb")
+            cp.pack(side="right", padx=(0, 10))
+            return f, nm, tm, cp
 
-        self._bf, self._bn, self._bt = player_panel(left)
+        self._bf, self._bn, self._bt, self._bc = player_panel(left)
 
         self._canvas = tk.Canvas(left, width=px, height=px, highlightthickness=0,
                                  bg=self.BG_IDLE)
-        self._wf, self._wn, self._wt = player_panel(left)
+        self._wf, self._wn, self._wt, self._wc = player_panel(left)
         self._set_name_label(self._wn, self.white_name, True)
         self._set_name_label(self._bn, self.black_name, False)
         # White's panel is packed before the canvas so it keeps its height
@@ -537,7 +555,7 @@ class ChessGUI(SettingsDialogMixin, BoardMixin, GraphMixin, EnginePickerMixin,
             (self._wf, self._wn, self._wt),
             (self._bf, self._bn, self._bt),
         ]:
-            for w in (frame, nm, tm):
+            for w in (frame, *frame.winfo_children()):
                 w.config(bg=self.BG_IDLE)
             tm.config(text="--:--.-")
         self._update_action_btn()
@@ -594,7 +612,7 @@ class ChessGUI(SettingsDialogMixin, BoardMixin, GraphMixin, EnginePickerMixin,
                 (self._bf, self._bn, self._bt, chess.BLACK),
             ]:
                 bg = self.BG_ACTV if active == color else self.BG_IDLE
-                for w in (frame, nm, tm):
+                for w in (frame, *frame.winfo_children()):
                     w.config(bg=bg)
         if "engine_changed" in d:
             self._update_engine_name(*d["engine_changed"])

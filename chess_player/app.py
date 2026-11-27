@@ -246,7 +246,7 @@ def run_gui(args):
         if tour:
             tour["save"] = save
             tour["stop"].set()
-            gui.update(status="Stopping tournament…")
+            gui.update(status="Ending tournament…")
 
     def tournament_info() -> Optional[dict]:
         """Main thread: what the running tournament allows to change, for
@@ -260,7 +260,8 @@ def run_gui(args):
             fresh = not t.games and not ctl["game_started"]
             min_c = 1 if fresh else t.min_count(ctl["round"])
             st = ctl["make_state"]()
-            return {"fresh": fresh, "format": t.fmt, "count": t.count,
+            return {"fresh": fresh, "done": bool(tour.get("done")),
+                    "format": t.fmt, "count": t.count,
                     "min_count": min_c, "auto_pause": tour["auto_pause"],
                     "engines": [e["path"] for e in st["engines"]],
                     "time": st["time"], "inc": st["inc"], "load_two": st["load_two"]}
@@ -277,8 +278,14 @@ def run_gui(args):
             t = ctl["tourney"]
             if "count" in ch and int(ch["count"]) != t.count:
                 t.set_count(max(int(ch["count"]), t.min_count(ctl["round"])))
+            # A finished tournament given more rounds plays on (see wait_finished)
+            extended = bool(tour.get("done")) and t.total_rounds > ctl["round"] + 1
         ctl["autosave"]()
-        gui._render_tournament(ctl["snap"]())
+        if extended:
+            gui.show_tournament_extended()
+            gui.update(status="Tournament extended — press ▶ to play the next game")
+        gui._render_tournament(ctl["snap"]("finished" if tour.get("done") and not extended
+                                           else "running"))
 
     def restart_tournament(cfg: dict):
         """Main thread: replace a tournament that has not played a game yet
@@ -414,12 +421,39 @@ def run_gui(args):
                     return False
             return not stop.is_set()
 
+        def wait_finished() -> bool:
+            """All rounds are played: keep the last game on screen and the
+            engines loaded until the user ends the tournament (✓) or extends
+            it. True if it was extended."""
+            final_snap = snap("finished")
+            winners = [r["name"] for r in final_snap["rows"] if r["rank"] == 1]
+            msg = f"Tournament finished — winner: {', '.join(winners)}"
+            print(f"\n{msg}")
+            for r in final_snap["rows"]:
+                print(f"  {r['rank']:>2}. {r['name']:<24} {r['points']:>5g} pts"
+                      f"   SB {r['sb']:.2f}   (+{r['wins']} ={r['draws']} -{r['losses']})")
+            tour["done"] = True
+            gui.update(call=gui.show_tournament_done, tournament=final_snap,
+                       status=msg + " — press ✓ to end it, or extend it with ♛ Tournament")
+            while not stop.wait(timeout=0.1):
+                with lock:
+                    if tourney.total_rounds > rnd:
+                        tour["done"] = False
+                        return True
+            return False
+
         rnd = 0
+        finished = False
         while not stop.is_set():
             with lock:
                 # The number of rounds may change while paused
-                if rnd >= tourney.total_rounds:
-                    break
+                more = rnd < tourney.total_rounds
+            if not more:
+                if wait_finished():
+                    continue   # extended: play the new rounds
+                finished = True   # ended with ✓
+                break
+            with lock:
                 ctl["round"] = rnd
                 pairs, bye = tourney.pairings(rnd)
                 if bye is not None and tourney.fmt == "swiss" and not tourney.has_bye(rnd):
@@ -492,20 +526,15 @@ def run_gui(args):
                     break
             rnd += 1
 
-        finished = not stop.is_set()
         for eng in engines:
             eng.quit()
         final_snap = snap("finished" if finished else "stopped")
         if finished:
             winners = [r["name"] for r in final_snap["rows"] if r["rank"] == 1]
             msg = f"Tournament finished — winner: {', '.join(winners)}"
-            print(f"\n{msg}")
-            for r in final_snap["rows"]:
-                print(f"  {r['rank']:>2}. {r['name']:<24} {r['points']:>5g} pts"
-                      f"   SB {r['sb']:.2f}   (+{r['wins']} ={r['draws']} -{r['losses']})")
         else:
             msg = "Tournament stopped"
-        final = None if finished else make_state()
+        final = make_state()   # saved to a file if the user asked for that
         if finished:
             done_state = make_state()
 

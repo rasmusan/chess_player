@@ -16,23 +16,27 @@ class TournamentDialogMixin:
         if not self._tournament_start_cb:
             return
         start_cb = self._tournament_start_cb
-        restart = None   # info on a running tournament that can be set up anew
+        # While a tournament runs (paused, or finished and waiting for ✓) the
+        # dialog shows its setup. Before its first game it can be set up anew
+        # (Apply restarts it); after that only the number of rounds / matches
+        # (also to extend a finished one) and pausing can be changed.
+        restart = None   # info on the running tournament
+        locked = False
         if self._tournament_running:
             if self._resume_event.is_set() or not self._tournament_info_cb:
                 return
-            info = self._tournament_info_cb()
-            if info is None:
+            restart = self._tournament_info_cb()
+            if restart is None:
                 return
-            if not info["fresh"]:
-                self._open_tournament_edit(info)
-                return
-            restart, start_cb = info, self._tournament_restart_cb
+            locked = not restart["fresh"]
+            start_cb = self._tournament_restart_cb
         tk = self._tk
         BG, FG, DIM = "#1a1a1a", "#cccccc", "#888888"
         ENTRY = dict(font=self._font(10), width=9, bg="#2e2e2e", fg="white",
                      insertbackground="white", relief="flat",
                      highlightthickness=1, highlightbackground="#444444",
-                     highlightcolor="#55aaff", justify="right")
+                     highlightcolor="#55aaff", justify="right",
+                     disabledbackground="#222222", disabledforeground="#777777")
         saved = load_tournament_settings()
         if restart:   # show the setup of the paused tournament
             cnt_key = "rr_rounds" if restart["format"] == "rr" else "swiss_matches"
@@ -135,10 +139,12 @@ class TournamentDialogMixin:
         count_lbl = tk.Label(cf, text="", font=self._font(10), fg=FG, bg=BG,
                              width=20, anchor="w")
         count_lbl.pack(side="left")
-        tk.Spinbox(cf, from_=1, to=99, textvariable=count_var, width=5,
+        min_count = restart["min_count"] if locked else 1
+        count_sb = tk.Spinbox(cf, from_=min_count, to=999, textvariable=count_var, width=5,
                    font=self._font(10), bg="#2e2e2e", fg="white", relief="flat",
                    buttonbackground="#3a3a3a", insertbackground="white",
-                   justify="right").pack(side="left")
+                   justify="right")
+        count_sb.pack(side="left")
         games_lbl = tk.Label(cf, text="", font=self._font(9), fg=DIM, bg=BG)
         games_lbl.pack(side="left", padx=(10, 0))
 
@@ -172,8 +178,8 @@ class TournamentDialogMixin:
         CB = dict(font=self._font(10), fg=FG, bg=BG, selectcolor="#2e2e2e",
                   activebackground=BG, activeforeground="white", cursor="hand2")
         auto_var = tk.BooleanVar(value=bool(saved.get("auto_pause", False)))
-        tk.Checkbutton(win, text="Pause before each match", variable=auto_var, **CB
-                       ).grid(row=7, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        auto_cb = tk.Checkbutton(win, text="Pause before each match", variable=auto_var, **CB)
+        auto_cb.grid(row=7, column=0, columnspan=4, sticky="w", pady=(8, 0))
         load_two_var = tk.BooleanVar(value=bool(saved.get("load_two", False)))
         tk.Checkbutton(win, text="Load only two engines at a time (saves memory)",
                        variable=load_two_var, **CB
@@ -233,15 +239,40 @@ class TournamentDialogMixin:
             if n < 2:
                 games_lbl.config(text="select at least 2 engines")
                 return
-            total = c * n * (n - 1) // 2 if fmt == "rr" else c * (n // 2)
+            def _total(c):
+                return c * n * (n - 1) // 2 if fmt == "rr" else c * (n // 2)
+            total = _total(c)
             note = " (with rematches)" if fmt == "swiss" and c > n - 1 + n % 2 else ""
+            if locked and c != restart["count"]:
+                diff = total - _total(restart["count"])
+                note += f" ({diff:+d})"
             games_lbl.config(text=f"= {total} game{'s' if total != 1 else ''}{note}")
 
         lb.bind("<<ListboxSelect>>", _update)
         count_var.trace_add("write", _update)
         _update()
 
+        def _apply_running():
+            """Change rounds / matches and pausing of the running tournament."""
+            try:
+                count = int(count_var.get())
+                if not min_count <= count <= 999:
+                    raise ValueError
+            except ValueError:
+                msg.config(text=f"Enter a number from {min_count} to 999.")
+                return
+            win.destroy()
+            if self._tournament_edit_cb and self._tournament_running:
+                self._tournament_edit_cb({"count": count, "auto_pause": auto_var.get()})
+                saved = load_tournament_settings()
+                key = "rr_rounds" if restart["format"] == "rr" else "swiss_matches"
+                save_tournament_settings({**saved, key: count,
+                                           "auto_pause": auto_var.get()})
+
         def _start(event=None):
+            if locked:
+                _apply_running()
+                return
             sel = [items[k][1] for k in lb.curselection()]
             if len(sel) < 2:
                 msg.config(text="Select at least 2 engines.")
@@ -314,14 +345,38 @@ class TournamentDialogMixin:
             win.destroy()
             start_cb({"resume": st})
 
+        if locked:
+            # Only the number of rounds / matches and pausing can be changed
+            def _lock(w):
+                for ch in w.winfo_children():
+                    if ch not in (count_sb, auto_cb, count_lbl, games_lbl, msg):
+                        try:
+                            ch.config(state="disabled", cursor="")
+                        except tk.TclError:
+                            pass
+                    _lock(ch)
+            _lock(win)
+            lb.config(selectbackground="#2a3a10")
+
         tk.Button(win, text="Continue from file…", font=self._font(9), bg="#3a3a3a",
                   fg="#ffcc44", relief="flat", padx=10, pady=4, activebackground="#555555",
-                  activeforeground="#ffdd66", cursor="hand2", command=_continue
+                  activeforeground="#ffdd66", disabledforeground="#555555",
+                  cursor="" if restart else "hand2", command=_continue,
+                  state="disabled" if restart else "normal",
                   ).grid(row=11, column=0, columnspan=2, sticky="w", pady=(12, 0))
+
+        def _stop():
+            win.destroy()
+            self._confirm_end_tournament()
 
         bf = tk.Frame(win, bg=BG)
         bf.grid(row=11, column=2, columnspan=2, sticky="e", pady=(12, 0))
-        tk.Button(bf, text="Start", font=self._font(9),
+        if restart:   # a tournament is running: Stop ends it (asks to save)
+            tk.Button(bf, text="Stop", font=self._font(9),
+                      bg="#5a1500", fg="#ff5533", relief="flat", padx=14, pady=4,
+                      activebackground="#7a2000", activeforeground="#ff7755",
+                      cursor="hand2", command=_stop).pack(side="left", padx=(0, 8))
+        tk.Button(bf, text="Apply" if restart else "Start", font=self._font(9),
                   bg="#2a4a00", fg="#88ff44", relief="flat", padx=14, pady=4,
                   activebackground="#3a6a00", activeforeground="#aaff66",
                   cursor="hand2", command=_start).pack(side="left", padx=(0, 8))
@@ -329,89 +384,23 @@ class TournamentDialogMixin:
                   bg="#3a3a3a", fg="#aaaaaa", relief="flat", padx=12, pady=4,
                   activebackground="#555555", activeforeground="white",
                   cursor="hand2", command=win.destroy).pack(side="left")
-        if restart:
-            tk.Label(win, text="Start restarts the paused tournament with this setup.",
-                     font=self._font(9), fg="#ffaa44", bg=BG
-                     ).grid(row=12, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        note = None
+        if locked and restart["done"]:
+            note = ("The tournament is finished: raise the rounds / matches\n"
+                    "and Apply to extend it, or Stop to end it.")
+        elif locked:
+            note = "Engines and time control can only be changed before the first game."
+        elif restart:
+            note = "Apply restarts the paused tournament with this setup."
         elif self.game_in_progress:
-            tk.Label(win, text="Starting a tournament stops the current game.",
-                     font=self._font(9), fg="#ffaa44", bg=BG
-                     ).grid(row=12, column=0, columnspan=4, sticky="w", pady=(8, 0))
+            note = "Starting a tournament stops the current game."
+        if note:
+            tk.Label(win, text=note, font=self._font(9), fg="#ffaa44", bg=BG,
+                     justify="left").grid(row=12, column=0, columnspan=4,
+                                          sticky="w", pady=(8, 0))
 
         win.bind("<Escape>", lambda e: win.destroy())
         win.bind("<Return>", _start)
-
-        win.update_idletasks()
-        x = self.root.winfo_rootx() + (self.root.winfo_width()  - win.winfo_reqwidth())  // 2
-        y = self.root.winfo_rooty() + (self.root.winfo_height() - win.winfo_reqheight()) // 3
-        win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
-        win.grab_set()
-        win.wait_window()
-
-    def _open_tournament_edit(self, info: dict):
-        """While a started tournament is paused: change the number of rounds /
-        matches and auto-pause. The engines and time control stay fixed."""
-        tk = self._tk
-        BG, FG, DIM = "#1a1a1a", "#cccccc", "#888888"
-        win = tk.Toplevel(self.root)
-        win.title("Tournament")
-        win.configure(bg=BG, padx=18, pady=14)
-        win.resizable(False, False)
-        win.transient(self.root)
-
-        fmt_name = "Round robin" if info["format"] == "rr" else "Swiss"
-        tk.Label(win, text=f"Tournament · {fmt_name}", font=self._font(12, "bold"),
-                 fg="white", bg=BG).grid(row=0, column=0, columnspan=3,
-                                         sticky="w", pady=(0, 10))
-        tk.Label(win, text="Rounds:" if info["format"] == "rr" else "Matches per engine:",
-                 font=self._font(10), fg=FG, bg=BG, width=20, anchor="w"
-                 ).grid(row=1, column=0, sticky="w")
-        count_var = tk.StringVar(value=str(info["count"]))
-        tk.Spinbox(win, from_=info["min_count"], to=999, textvariable=count_var,
-                   width=5, font=self._font(10), bg="#2e2e2e", fg="white",
-                   relief="flat", buttonbackground="#3a3a3a",
-                   insertbackground="white", justify="right").grid(row=1, column=1, sticky="w")
-        tk.Label(win, text=f"(at least {info['min_count']})", font=self._font(9),
-                 fg=DIM, bg=BG).grid(row=1, column=2, sticky="w", padx=(10, 0))
-        auto_var = tk.BooleanVar(value=info["auto_pause"])
-        tk.Checkbutton(win, text="Pause before each match", variable=auto_var,
-                       font=self._font(10), fg=FG, bg=BG, selectcolor="#2e2e2e",
-                       activebackground=BG, activeforeground="white", cursor="hand2"
-                       ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
-        tk.Label(win, text="Engines can only be changed before the first game.",
-                 font=self._font(9), fg=DIM, bg=BG
-                 ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
-        msg = tk.Label(win, text="", font=self._font(9), fg="#ff5533", bg=BG)
-        msg.grid(row=4, column=0, columnspan=3, sticky="w", pady=(4, 0))
-
-        def _ok(event=None):
-            try:
-                count = int(count_var.get())
-                if not info["min_count"] <= count <= 999:
-                    raise ValueError
-            except ValueError:
-                msg.config(text=f"Enter a number from {info['min_count']} to 999.")
-                return
-            win.destroy()
-            if self._tournament_edit_cb and self._tournament_running:
-                self._tournament_edit_cb({"count": count, "auto_pause": auto_var.get()})
-                saved = load_tournament_settings()
-                key = "rr_rounds" if info["format"] == "rr" else "swiss_matches"
-                save_tournament_settings({**saved, key: count,
-                                           "auto_pause": auto_var.get()})
-
-        bf = tk.Frame(win, bg=BG)
-        bf.grid(row=5, column=0, columnspan=3, sticky="e", pady=(12, 0))
-        tk.Button(bf, text="OK", font=self._font(9),
-                  bg="#2a4a00", fg="#88ff44", relief="flat", padx=14, pady=4,
-                  activebackground="#3a6a00", activeforeground="#aaff66",
-                  cursor="hand2", command=_ok).pack(side="left", padx=(0, 8))
-        tk.Button(bf, text="Cancel", font=self._font(9),
-                  bg="#3a3a3a", fg="#aaaaaa", relief="flat", padx=12, pady=4,
-                  activebackground="#555555", activeforeground="white",
-                  cursor="hand2", command=win.destroy).pack(side="left")
-        win.bind("<Escape>", lambda e: win.destroy())
-        win.bind("<Return>", _ok)
 
         win.update_idletasks()
         x = self.root.winfo_rootx() + (self.root.winfo_width()  - win.winfo_reqwidth())  // 2

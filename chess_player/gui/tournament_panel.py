@@ -296,6 +296,7 @@ class TournamentPanelMixin:
         """Switch buttons to tournament behaviour and start running (or wait
         for ▶ if `paused`). Main thread."""
         self._tournament_running = True
+        self._tournament_done = False
         self._think_start  = None
         self._game_started = True
         self._game_over    = False
@@ -337,15 +338,37 @@ class TournamentPanelMixin:
             (self._wf, self._wn, self._wt, white_time),
             (self._bf, self._bn, self._bt, black_time),
         ]:
-            for w in (frame, nm, tm):
+            for w in (frame, *frame.winfo_children()):
                 w.config(bg=self.BG_IDLE)
             if t is not None:
                 tm.config(text=fmt_time(t))
         self._update_action_btn()
 
+    def show_tournament_done(self):
+        """All games are played: the last game stays on screen and ■ becomes
+        ✓, which ends the tournament. Main thread."""
+        if not self._tournament_running:
+            return
+        self._tournament_done = True
+        self._resume_event.clear()
+        self._play_btn.config(text="▶", state="disabled", fg="#555555", cursor="")
+        self._update_action_btn()
+        self._update_tourn_btn()
+
+    def show_tournament_extended(self):
+        """A finished tournament got more rounds: ▶ plays on. Main thread."""
+        if not (self._tournament_running and self._tournament_done):
+            return
+        self._tournament_done = False
+        self._resume_event.clear()
+        self._play_btn.config(text="▶", state="normal", fg="#88ff44", cursor="hand2")
+        self._update_action_btn()
+        self._update_tourn_btn()
+
     def exit_tournament_mode(self):
         """Back to normal buttons. The panel stays until closed with ✕. Main thread."""
         self._tournament_running = False
+        self._tournament_done = False
         self._think_start = None
         self._update_tourn_btn()
         self._t_close.config(fg="#aaaaaa", cursor="hand2")

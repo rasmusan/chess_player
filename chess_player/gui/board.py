@@ -106,6 +106,31 @@ class BoardMixin:
                         self._draw_piece(c, cx, cy, SQ, piece)
 
         self._draw_coords(c, SQ, X0, Y0)
+        self._update_captures(board)
+
+    # Captured-piece glyphs, by the color of the captured piece
+    _CAP_ORDER = (chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT, chess.PAWN)
+    _CAP_GLYPH = {(chess.QUEEN, True): "♕", (chess.ROOK, True): "♖",
+                  (chess.BISHOP, True): "♗", (chess.KNIGHT, True): "♘",
+                  (chess.PAWN, True): "♙",
+                  (chess.QUEEN, False): "♛", (chess.ROOK, False): "♜",
+                  (chess.BISHOP, False): "♝", (chess.KNIGHT, False): "♞",
+                  (chess.PAWN, False): "♟"}
+
+    def _update_captures(self, board: chess.Board):
+        """Next to each clock: the opponent's pieces this player is up, as the
+        net difference per piece type (a traded pair cancels out)."""
+        if not hasattr(self, "_wc"):
+            return
+        w_txt = b_txt = ""
+        for pt in self._CAP_ORDER:
+            d = len(board.pieces(pt, chess.WHITE)) - len(board.pieces(pt, chess.BLACK))
+            if d > 0:
+                w_txt += self._CAP_GLYPH[(pt, False)] * d
+            elif d < 0:
+                b_txt += self._CAP_GLYPH[(pt, True)] * -d
+        self._wc.config(text=w_txt)
+        self._bc.config(text=b_txt)
 
     # ── Move animation ──
 
